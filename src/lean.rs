@@ -8,6 +8,7 @@ const LEN_MASK: usize = (std::u32::MAX as usize) << 32;
 impl crate::generic::Meta for Meta {
 	const MAX_LENGTH: usize = std::u32::MAX as usize;
 
+	#[inline]
 	fn new(len: usize, capacity: Option<usize>) -> Self {
 		assert!(len <= Self::MAX_LENGTH);
 
@@ -22,10 +23,12 @@ impl crate::generic::Meta for Meta {
 		}
 	}
 
+	#[inline]
 	fn len(&self) -> usize {
 		self.data >> 32
 	}
 
+	#[inline]
 	fn capacity(&self) -> Option<usize> {
 		let capacity = self.data & CAP_MASK;
 		if capacity == 0 {
@@ -35,11 +38,13 @@ impl crate::generic::Meta for Meta {
 		}
 	}
 
+	#[inline]
 	fn set_len(&mut self, len: usize) {
 		assert!(len <= Self::MAX_LENGTH);
 		self.data = (len << 32) | (self.data & CAP_MASK)
 	}
 
+	#[inline]
 	fn set_capacity(&mut self, capacity: Option<usize>) {
 		self.data = match capacity {
 			Some(capacity) => {

@@ -10,22 +10,61 @@ use crate::generic::{
 	CalfVec
 };
 
+/// A possible error value when converting a `CalfString` from a UTF-8 byte vector.
+///
+/// This type is the error type for the [`from_utf8`] method on [`CalfString`]. It
+/// is designed in such a way to carefully avoid reallocations: the
+/// [`into_bytes`] method will give back the byte vector that was used in the
+/// conversion attempt.
+///
+/// [`from_utf8`]: CalfString::from_utf8
+/// [`into_bytes`]: FromUtf8Error::into_bytes
+///
+/// The [`Utf8Error`] type provided by [`std::str`] represents an error that may
+/// occur when converting a slice of [`u8`]s to a [`&str`]. In this sense, it's
+/// an analogue to `FromUtf8Error`, and you can get one from a `FromUtf8Error`
+/// through the [`utf8_error`] method.
+///
+/// [`Utf8Error`]: core::str::Utf8Error
+/// [`std::str`]: core::str
+/// [`&str`]: prim@str
+/// [`utf8_error`]: Self::utf8_error
 pub struct FromUtf8Error<'a, M: Meta, const N: usize> {
 	bytes: CalfVec<'a, M, u8, N>,
 	error: str::Utf8Error
 }
 
 impl<'a, M: Meta, const N: usize> FromUtf8Error<'a, M, N> {
-	pub fn bytes(&self) -> &[u8] {
+	/// Returns a slice of [`u8`]s bytes that were attempted to convert to a `CalfString`.
+	pub fn as_bytes(&self) -> &[u8] {
 		&self.bytes
 	}
 
+	/// Returns the bytes that were attempted to convert to a `CalfString`.
+	///
+	/// This method is carefully constructed to avoid allocation. It will
+	/// consume the error, moving out the bytes, so that a copy of the bytes
+	/// does not need to be made.
+	pub fn into_bytes(self) -> CalfVec<'a, M, u8, N> {
+		self.bytes
+	}
+
+	/// Fetch a `Utf8Error` to get more details about the conversion failure.
+	///
+	/// The [`Utf8Error`] type provided by [`std::str`] represents an error that may
+	/// occur when converting a slice of [`u8`]s to a [`&str`]. In this sense, it's
+	/// an analogue to `FromUtf8Error`. See its documentation for more details
+	/// on using it.
+	///
+	/// [`std::str`]: core::str
+	/// [`&str`]: prim@str
 	pub fn utf8_error(&self) -> str::Utf8Error {
 		self.error
 	}
 }
 
 pub struct CalfString<'a, M: Meta, const N: usize> {
+	/// Internal bytes buffer.
 	vec: CalfVec<'a, M, u8, N>
 }
 
