@@ -5,15 +5,17 @@ use std::{
 	ops::{
 		Deref,
 		DerefMut
-	}
+	},
+	borrow::Cow,
+	fmt
 };
 
 /// Metadata representing the length and capacity of the array.
 ///
 /// This crate provides two implementation of this trait:
-/// [`wide::Meta`] stores the length and capacity with two `usize`.
+/// [`wide::Meta`](crate::wide::Meta) stores the length and capacity with two `usize`.
 /// Then the maximum size/capacity depends on the bit-depth of the plateform.
-/// For 64-bit plateforms, this crate also provides [`lean::Meta`] that stores both the length
+/// For 64-bit plateforms, this crate also provides [`lean::Meta`](crate::lean::Meta) that stores both the length
 /// and capacity on a single `usize`. As a result, the maximum size/capacity is [`std::u32::MAX`].
 pub trait Meta {
 	/// Maximum size/capacity of the array using this metadata format.
@@ -53,7 +55,7 @@ union Data<T, const N: usize> {
 /// Contiguous growable array type that is either borrowed, stack allocated or heap allocated.
 ///
 /// This type behaves just like a `Vec<T>` but with a few more optimizations.
-/// Just like [`std::borrow::Cow`], the data can be simply borrowed as long as it is not accessed
+/// Just like [`Cow`](std::borrow::Cow), the data can be simply borrowed as long as it is not accessed
 /// mutably.
 /// Otherwise just like [`SmallVec`](https://crates.io/crates/smallvec) the data is stored on the
 /// stack as long as the buffer's capacity does not exceed a given capacity
@@ -62,7 +64,7 @@ union Data<T, const N: usize> {
 ///
 /// The maximum capacity of a `CalfVec<T>` array depends on the metadata format used
 /// which is given as type parameter `M`, implementing the [`Meta`] trait.
-/// By default the `wide::Meta` is used, which behaves just `Vec`.
+/// By default the `wide::Meta` is used, which behaves just like `Vec`.
 /// In this case, the maximum capacity is `std::usize::MAX`.
 ///
 /// # Examples
@@ -177,7 +179,7 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> {
 	///
 	/// The caller must also ensure that the memory the pointer (non-transitively) points to
 	/// is never written to (except inside an `UnsafeCell`) using this pointer or any pointer
-	/// derived from it. If you need to mutate the contents of the slice, use [`as_mut_ptr`].
+	/// derived from it. If you need to mutate the contents of the slice, use [`as_mut_ptr`](#as_mut_ptr).
 	#[inline]
 	pub fn as_ptr(&self) -> *const T {
 		unsafe {
@@ -307,6 +309,28 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> where T: Clone {
 		self.to_mut().reserve(additional)
 	}
 
+	/// Inserts an element at position `index` within the vector, shifting all
+	/// elements after it to the right.
+	///
+	/// # Panics
+	///
+	/// Panics if `index > len`.
+	#[inline]
+	pub fn insert(&mut self, index: usize, element: T) {
+		self.to_mut().insert(index, element)
+	}
+
+	/// Removes and returns the element at position `index` within the vector,
+	/// shifting all elements after it to the left.
+	///
+	/// # Panics
+	///
+	/// Panics if `index` is out of bounds.
+	#[inline]
+	pub fn remove(&mut self, index: usize) -> T {
+		self.to_mut().remove(index)
+	}
+
 	/// Moves all the elements of `other` into `Self`, leaving `other` empty.
 	///
 	/// # Panics
@@ -322,7 +346,7 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> where T: Clone {
 	/// Iterates over the slice `other`, clones each element, and then appends
 	/// it to this `CalfVec`. The `other` vector is traversed in-order.
 	///
-	/// Note that this function is same as [`extend`] except that it is
+	/// Note that this function is same as [`extend`](#extend) except that it is
 	/// specialized to work with slices instead. If and when Rust gets
 	/// specialization this function will likely be deprecated (but still
 	/// available).
@@ -355,6 +379,37 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> where T: Clone {
 	#[inline]
 	pub fn pop(&mut self) -> Option<T> {
 		self.to_mut().pop()
+	}
+
+	/// Removes all but the first of consecutive elements in the vector satisfying a given equality
+	/// relation.
+	///
+	/// The `same_bucket` function is passed references to two elements from the vector and
+	/// must determine if the elements compare equal. The elements are passed in opposite order
+	/// from their order in the slice, so if `same_bucket(a, b)` returns `true`, `a` is removed.
+	///
+	/// If the vector is sorted, this removes all duplicates.
+	#[inline]
+	pub fn dedup_by<F>(&mut self, same_bucket: F) where F: FnMut(&mut T, &mut T) -> bool {
+		self.to_mut().dedup_by(same_bucket)
+	}
+
+	/// Removes all but the first of consecutive elements in the vector that resolve to the same
+	/// key.
+	///
+	/// If the vector is sorted, this removes all duplicates.
+	#[inline]
+	pub fn dedup_by_key<F, K>(&mut self, key: F) where F: FnMut(&mut T) -> K, K: PartialEq {
+		self.to_mut().dedup_by_key(key)
+	}
+
+	/// Removes consecutive repeated elements in the vector according to the
+	/// [`PartialEq`] trait implementation.
+	///
+	/// If the vector is sorted, this removes all duplicates.
+	#[inline]
+	pub fn dedup(&mut self) where T: PartialEq {
+		self.to_mut().dedup()
 	}
 }
 
@@ -394,6 +449,48 @@ impl<'a, M: Meta, T, const N: usize> Extend<T> for CalfVec<'a, M, T, N> where T:
 	// }
 }
 
+impl<'a, M: Meta, T: fmt::Debug, const N: usize> fmt::Debug for CalfVec<'a, M, T, N> {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		fmt::Debug::fmt(&**self, f)
+	}
+}
+
+impl<'a, M: Meta, T, const N: usize> AsRef<CalfVec<'a, M, T, N>> for CalfVec<'a, M, T, N> {
+	fn as_ref(&self) -> &CalfVec<'a, M, T, N> {
+		self
+	}
+}
+
+impl<'a, M: Meta, T, const N: usize> AsMut<CalfVec<'a, M, T, N>> for CalfVec<'a, M, T, N> {
+	fn as_mut(&mut self) -> &mut CalfVec<'a, M, T, N> {
+		self
+	}
+}
+
+impl<'a, M: Meta, T, const N: usize> AsRef<[T]> for CalfVec<'a, M, T, N> {
+	fn as_ref(&self) -> &[T] {
+		self
+	}
+}
+
+impl<'a, M: Meta, T, const N: usize> AsMut<[T]> for CalfVec<'a, M, T, N> where T: Clone {
+	fn as_mut(&mut self) -> &mut [T] {
+		self
+	}
+}
+
+impl<'a, M: Meta, T, const N: usize> From<&'a [T]> for CalfVec<'a, M, T, N> {
+	fn from(s: &'a [T]) -> CalfVec<'a, M, T, N> {
+		CalfVec {
+			meta: M::new(s.len(), None),
+			// it is safe to convert to *mut here
+			// because without capacity, the data won't be accessed mutably.
+			data: Data { ptr: s.as_ptr() as *mut T },
+			lifetime: PhantomData
+		}
+	}
+}
+
 pub struct CalfVecMut<'v, 'a, M: Meta, T, const N: usize> {
 	vec: &'v mut CalfVec<'a, M, T, N>
 }
@@ -426,7 +523,7 @@ impl<'v, 'a, M: Meta, T, const N: usize> CalfVecMut<'v, 'a, M, T, N> {
 	///
 	/// The caller must also ensure that the memory the pointer (non-transitively) points to
 	/// is never written to (except inside an `UnsafeCell`) using this pointer or any pointer
-	/// derived from it. If you need to mutate the contents of the slice, use [`as_mut_ptr`].
+	/// derived from it. If you need to mutate the contents of the slice, use [`as_mut_ptr`](#as_mut_ptr).
 	#[inline]
 	pub fn as_ptr(&self) -> *const T {
 		unsafe {
@@ -462,6 +559,16 @@ impl<'v, 'a, M: Meta, T, const N: usize> CalfVecMut<'v, 'a, M, T, N> {
 			} else {
 				self.vec.data.ptr
 			}
+		}
+	}
+
+	/// Extracts a mutable slice of the entire vector.
+	///
+	/// Equivalent to `&mut s[..]`.
+	#[inline]
+	pub fn as_mut_slice(&mut self) -> &'v mut [T] {
+		unsafe {
+			std::slice::from_raw_parts_mut(self.as_mut_ptr(), self.len())
 		}
 	}
 
@@ -536,6 +643,69 @@ impl<'v, 'a, M: Meta, T, const N: usize> CalfVecMut<'v, 'a, M, T, N> {
 		}
 	}
 
+	/// Inserts an element at position `index` within the vector, shifting all
+	/// elements after it to the right.
+	///
+	/// # Panics
+	///
+	/// Panics if `index > len`.
+	pub fn insert(&mut self, index: usize, element: T) {
+		let len = self.len();
+		if index > len {
+			panic!("insertion index (is {}) should be <= len (which is {})", index, len);
+		}
+
+		// space for the new element
+		if len == self.capacity() {
+			self.reserve(1);
+		}
+
+		unsafe {
+			// infallible
+			// The spot to put the new value
+			{
+				let p = self.as_mut_ptr().add(index);
+				// Shift everything over to make space. (Duplicating the
+				// `index`th element into two consecutive places.)
+				ptr::copy(p, p.offset(1), len - index);
+				// Write it in, overwriting the first copy of the `index`th
+				// element.
+				ptr::write(p, element);
+			}
+			self.vec.meta.set_len(len + 1);
+		}
+	}
+
+	/// Removes and returns the element at position `index` within the vector,
+	/// shifting all elements after it to the left.
+	///
+	/// # Panics
+	///
+	/// Panics if `index` is out of bounds.
+	pub fn remove(&mut self, index: usize) -> T {
+		let len = self.len();
+		if index >= len {
+			panic!("removal index (is {}) should be < len (is {})", index, len);
+		}
+
+		unsafe {
+			// infallible
+			let ret;
+			{
+				// the place we are taking from.
+				let ptr = self.as_mut_ptr().add(index);
+				// copy it out, unsafely having a copy of the value on
+				// the stack and in the vector at the same time.
+				ret = ptr::read(ptr);
+
+				// Shift everything down to fill in that spot.
+				ptr::copy(ptr.offset(1), ptr, len - index - 1);
+			}
+			self.vec.meta.set_len(len - 1);
+			ret
+		}
+	}
+
 	/// Moves all the elements of `other` into `Self`, leaving `other` empty.
 	///
 	/// # Panics
@@ -599,6 +769,40 @@ impl<'v, 'a, M: Meta, T, const N: usize> CalfVecMut<'v, 'a, M, T, N> {
 			}
 		}
 	}
+
+	/// Removes all but the first of consecutive elements in the vector satisfying a given equality
+	/// relation.
+	///
+	/// The `same_bucket` function is passed references to two elements from the vector and
+	/// must determine if the elements compare equal. The elements are passed in opposite order
+	/// from their order in the slice, so if `same_bucket(a, b)` returns `true`, `a` is removed.
+	///
+	/// If the vector is sorted, this removes all duplicates.
+	pub fn dedup_by<F>(&mut self, same_bucket: F) where F: FnMut(&mut T, &mut T) -> bool {
+		let len = {
+			let (dedup, _) = self.as_mut_slice().partition_dedup_by(same_bucket);
+			dedup.len()
+		};
+		self.truncate(len);
+	}
+
+	/// Removes all but the first of consecutive elements in the vector that resolve to the same
+	/// key.
+	///
+	/// If the vector is sorted, this removes all duplicates.
+	#[inline]
+	pub fn dedup_by_key<F, K>(&mut self, mut key: F) where F: FnMut(&mut T) -> K, K: PartialEq {
+		self.dedup_by(|a, b| key(a) == key(b))
+	}
+
+	/// Removes consecutive repeated elements in the vector according to the
+	/// [`PartialEq`] trait implementation.
+	///
+	/// If the vector is sorted, this removes all duplicates.
+	#[inline]
+	pub fn dedup(&mut self) where T: PartialEq {
+		self.dedup_by(|a, b| a == b)
+	}
 }
 
 impl<'v, 'a, M: Meta, T, const N: usize> Deref for CalfVecMut<'v, 'a, M, T, N> {
@@ -645,3 +849,44 @@ impl<'v, 'a, M: Meta, T, const N: usize> Extend<T> for CalfVecMut<'v, 'a, M, T, 
 	// 	self.reserve(additional);
 	// }
 }
+
+macro_rules! impl_slice_eq1 {
+	([$($vars:tt)*] $lhs:ty, $rhs:ty $(where $ty:ty: $bound:ident)?) => {
+		impl<$($vars)*> PartialEq<$rhs> for $lhs where A: PartialEq<B>, $($ty: $bound)? {
+			#[inline]
+			fn eq(&self, other: &$rhs) -> bool { self[..] == other[..] }
+			#[inline]
+			fn ne(&self, other: &$rhs) -> bool { self[..] != other[..] }
+		}
+	}
+}
+
+impl_slice_eq1! { ['a, 'b, A, B, O: Meta, P: Meta, const N: usize, const M: usize] CalfVec<'a, O, A, N>, CalfVec<'b, P, B, M> }
+impl_slice_eq1! { ['a, A, B, M: Meta, const N: usize] CalfVec<'a, M, A, N>, Vec<B> }
+impl_slice_eq1! { ['b, A, B, M: Meta, const N: usize] Vec<A>, CalfVec<'b, M, B, N> }
+impl_slice_eq1! { ['a, A, B, M: Meta, const N: usize] CalfVec<'a, M, A, N>, &[B] }
+impl_slice_eq1! { ['a, A, B, M: Meta, const N: usize] CalfVec<'a, M, A, N>, &mut [B] }
+impl_slice_eq1! { ['b, A, B, M: Meta, const N: usize] &[A], CalfVec<'b, M, B, N> }
+impl_slice_eq1! { ['b, A, B, M: Meta, const N: usize] &mut [A], CalfVec<'b, M, B, N> }
+impl_slice_eq1! { ['a, A, B, M: Meta, const N: usize] CalfVec<'a, M, A, N>, Cow<'_, [B]> where B: Clone }
+impl_slice_eq1! { ['b, A, B, M: Meta, const N: usize] Cow<'_, [A]>, CalfVec<'b, M, B, N> where A: Clone }
+impl_slice_eq1! { ['a, A, B, M: Meta, const N: usize, const O: usize] CalfVec<'a, M, A, N>, [B; O] }
+impl_slice_eq1! { ['a, A, B, M: Meta, const N: usize, const O: usize] CalfVec<'a, M, A, N>, &[B; O] }
+impl_slice_eq1! { ['b, A, B, M: Meta, const N: usize, const O: usize] [A; O], CalfVec<'b, M, B, N> }
+impl_slice_eq1! { ['b, A, B, M: Meta, const N: usize, const O: usize] &[A; O], CalfVec<'b, M, B, N> }
+
+impl_slice_eq1! { ['a, 'b, A, B, O: Meta, P: Meta, const N: usize, const M: usize] CalfVecMut<'_, 'a, O, A, N>, CalfVecMut<'_, 'b, P, B, M> }
+impl_slice_eq1! { ['a, 'b, A, B, O: Meta, P: Meta, const N: usize, const M: usize] CalfVecMut<'_, 'a, O, A, N>, CalfVec<'b, P, B, M> }
+impl_slice_eq1! { ['a, 'b, A, B, O: Meta, P: Meta, const N: usize, const M: usize] CalfVec<'a, O, A, N>, CalfVecMut<'_, 'b, P, B, M> }
+impl_slice_eq1! { ['a, A, B, M: Meta, const N: usize] CalfVecMut<'_, 'a, M, A, N>, Vec<B> }
+impl_slice_eq1! { ['b, A, B, M: Meta, const N: usize] Vec<A>, CalfVecMut<'_, 'b, M, B, N> }
+impl_slice_eq1! { ['a, A, B, M: Meta, const N: usize] CalfVecMut<'_, 'a, M, A, N>, &[B] }
+impl_slice_eq1! { ['a, A, B, M: Meta, const N: usize] CalfVecMut<'_, 'a, M, A, N>, &mut [B] }
+impl_slice_eq1! { ['b, A, B, M: Meta, const N: usize] &[A], CalfVecMut<'_, 'b, M, B, N> }
+impl_slice_eq1! { ['b, A, B, M: Meta, const N: usize] &mut [A], CalfVecMut<'_, 'b, M, B, N> }
+impl_slice_eq1! { ['a, A, B, M: Meta, const N: usize] CalfVecMut<'_, 'a, M, A, N>, Cow<'_, [B]> where B: Clone }
+impl_slice_eq1! { ['b, A, B, M: Meta, const N: usize] Cow<'_, [A]>, CalfVecMut<'_, 'b, M, B, N> where A: Clone }
+impl_slice_eq1! { ['a, A, B, M: Meta, const N: usize, const O: usize] CalfVecMut<'_, 'a, M, A, N>, [B; O] }
+impl_slice_eq1! { ['a, A, B, M: Meta, const N: usize, const O: usize] CalfVecMut<'_, 'a, M, A, N>, &[B; O] }
+impl_slice_eq1! { ['b, A, B, M: Meta, const N: usize, const O: usize] [A; O], CalfVecMut<'_, 'b, M, B, N> }
+impl_slice_eq1! { ['b, A, B, M: Meta, const N: usize, const O: usize] &[A; O], CalfVecMut<'_, 'b, M, B, N> }
