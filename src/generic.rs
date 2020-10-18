@@ -194,6 +194,16 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> {
 		}
 	}
 
+	/// Extracts a slice containing the entire vector.
+	///
+	/// Equivalent to `&s[..]`.
+	#[inline]
+	pub fn as_slice(&self) -> &[T] {
+		unsafe {
+			std::slice::from_raw_parts(self.as_ptr(), self.len())
+		}
+	}
+
 	/// Returns true if the data is owned, i.e. if `to_mut` would be a no-op.
 	#[inline]
 	pub fn is_owned(&self) -> bool {
@@ -216,27 +226,6 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> {
 	#[inline]
 	pub fn capacity(&self) -> Option<usize> {
 		self.meta.capacity()
-	}
-
-	/// Extracts a slice containing the entire vector.
-	///
-	/// Equivalent to `&s[..]`.
-	#[inline]
-	pub fn as_slice(&self) -> &[T] {
-		unsafe {
-			match self.capacity() {
-				Some(capacity) => {
-					if capacity <= N {
-						(*self.data.stack).as_ref()
-					} else {
-						std::slice::from_raw_parts(self.data.ptr, self.len())
-					}
-				},
-				None => {
-					std::slice::from_raw_parts(self.data.ptr, self.len())
-				}
-			}
-		}
 	}
 }
 
@@ -278,6 +267,14 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> where T: Clone {
 	#[inline]
 	pub fn as_mut_ptr(&mut self) -> *mut T {
 		self.to_mut().as_mut_ptr()
+	}
+
+	/// Extracts a mutable slice of the entire vector.
+	///
+	/// Equivalent to `&mut s[..]`.
+	#[inline]
+	pub fn as_mut_slice(&mut self) -> &mut [T] {
+		self.to_mut().into_mut_slice()
 	}
 
 	/// Shortens the vector, keeping the first `len` elements and dropping
@@ -373,23 +370,10 @@ impl<'a, M: Meta, T, const N: usize> Deref for CalfVec<'a, M, T, N> {
 	}
 }
 
-impl<'a, M: Meta, T, const N: usize> DerefMut for CalfVec<'a, M, T, N> {
+impl<'a, M: Meta, T, const N: usize> DerefMut for CalfVec<'a, M, T, N> where T: Clone {
 	#[inline]
 	fn deref_mut(&mut self) -> &mut [T] {
-		unsafe {
-			match self.capacity() {
-				Some(capacity) => {
-					if capacity <= N {
-						(*self.data.stack).as_mut()
-					} else {
-						std::slice::from_raw_parts_mut(self.data.ptr, self.len())
-					}
-				},
-				None => {
-					std::slice::from_raw_parts_mut(self.data.ptr, self.len())
-				}
-			}
-		}
+		self.as_mut_slice()
 	}
 }
 
@@ -454,6 +438,16 @@ impl<'v, 'a, M: Meta, T, const N: usize> CalfVecMut<'v, 'a, M, T, N> {
 		}
 	}
 
+	/// Extracts a slice containing the entire vector.
+	///
+	/// Equivalent to `&s[..]`.
+	#[inline]
+	pub fn as_slice(&self) -> &[T] {
+		unsafe {
+			std::slice::from_raw_parts(self.as_ptr(), self.len())
+		}
+	}
+
 	/// Returns an unsafe mutable pointer to the vector's buffer.
 	///
 	/// The caller must ensure that the vector outlives the pointer this
@@ -468,6 +462,14 @@ impl<'v, 'a, M: Meta, T, const N: usize> CalfVecMut<'v, 'a, M, T, N> {
 			} else {
 				self.vec.data.ptr
 			}
+		}
+	}
+
+	/// Convert this handle and to a mutable slice of the entire vector.
+	#[inline]
+	pub fn into_mut_slice(mut self) -> &'v mut [T] {
+		unsafe {
+			std::slice::from_raw_parts_mut(self.as_mut_ptr(), self.len())
 		}
 	}
 
@@ -608,7 +610,7 @@ impl<'v, 'a, M: Meta, T, const N: usize> Deref for CalfVecMut<'v, 'a, M, T, N> {
 	}
 }
 
-impl<'v, 'a, M: Meta, T, const N: usize> DerefMut for CalfVecMut<'v, 'a, M, T, N> {
+impl<'v, 'a, M: Meta, T, const N: usize> DerefMut for CalfVecMut<'v, 'a, M, T, N> where T: Clone {
 	#[inline]
 	fn deref_mut(&mut self) -> &mut [T] {
 		self.vec.deref_mut()
