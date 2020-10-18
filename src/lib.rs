@@ -14,6 +14,6 @@ pub mod lean {
 }
 
 pub use wide::{
-	SmallCowVec,
-	SmallCowString
+	CalfVec,
+	CalfString
 };

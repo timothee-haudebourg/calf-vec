@@ -27,13 +27,13 @@ pub union Data<T, const N: usize> {
 	ptr: *mut T
 }
 
-pub struct SmallCowVec<'a, M: Meta, T, const N: usize> {
+pub struct CalfVec<'a, M: Meta, T, const N: usize> {
 	meta: M,
 	data: Data<T, N>,
 	lifetime: PhantomData<&'a T>
 }
 
-impl<'a, M: Meta, T, const N: usize> Drop for SmallCowVec<'a, M, T, N> {
+impl<'a, M: Meta, T, const N: usize> Drop for CalfVec<'a, M, T, N> {
 	fn drop(&mut self) {
 		match self.capacity() {
 			Some(capacity) => unsafe {
@@ -51,18 +51,18 @@ impl<'a, M: Meta, T, const N: usize> Drop for SmallCowVec<'a, M, T, N> {
 	}
 }
 
-impl<'a, M: Meta, T, const N: usize> SmallCowVec<'a, M, T, N> {
-	pub fn borrowed<B: AsRef<[T]>>(borrowed: &'a B) -> SmallCowVec<'a, M, T, N> {
+impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> {
+	pub fn borrowed<B: AsRef<[T]>>(borrowed: &'a B) -> CalfVec<'a, M, T, N> {
 		let slice = borrowed.as_ref();
 
-		SmallCowVec {
+		CalfVec {
 			meta: M::new(slice.len(), None),
 			data: Data { ptr: slice.as_ptr() as *mut T },
 			lifetime: PhantomData
 		}
 	}
 
-	pub fn owned<O: Into<Vec<T>>>(owned: O) -> SmallCowVec<'a, M, T, N> {
+	pub fn owned<O: Into<Vec<T>>>(owned: O) -> CalfVec<'a, M, T, N> {
 		let vec = owned.into();
 		if vec.capacity() <= N {
 			// put on stack
@@ -70,7 +70,7 @@ impl<'a, M: Meta, T, const N: usize> SmallCowVec<'a, M, T, N> {
 		} else {
 			// put on heap
 			let (ptr, len, capacity) = vec.into_raw_parts();
-			SmallCowVec {
+			CalfVec {
 				meta: M::new(len, Some(capacity)),
 				data: Data { ptr },
 				lifetime: PhantomData
@@ -128,8 +128,8 @@ impl<'a, M: Meta, T, const N: usize> SmallCowVec<'a, M, T, N> {
 	}
 }
 
-impl<'a, M: Meta, T, const N: usize> SmallCowVec<'a, M, T, N> where T: Clone {
-	pub fn to_mut<'v>(&'v mut self) -> SmallMutVec<'v, 'a, M, T, N> {
+impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> where T: Clone {
+	pub fn to_mut<'v>(&'v mut self) -> CalfVecMut<'v, 'a, M, T, N> {
 		if self.is_borrowed() {
 			// copy time!
 			unsafe {
@@ -148,7 +148,7 @@ impl<'a, M: Meta, T, const N: usize> SmallCowVec<'a, M, T, N> where T: Clone {
 			}
 		}
 
-		SmallMutVec {
+		CalfVecMut {
 			vec: self
 		}
 	}
@@ -214,10 +214,10 @@ impl<'a, M: Meta, T, const N: usize> SmallCowVec<'a, M, T, N> where T: Clone {
 	}
 }
 
-unsafe impl<'a, M: Meta + Send, T: Sync, const N: usize> Send for SmallCowVec<'a, M, T, N> {}
-unsafe impl<'a, M: Meta + Sync, T: Sync, const N: usize> Sync for SmallCowVec<'a, M, T, N> {}
+unsafe impl<'a, M: Meta + Send, T: Sync, const N: usize> Send for CalfVec<'a, M, T, N> {}
+unsafe impl<'a, M: Meta + Sync, T: Sync, const N: usize> Sync for CalfVec<'a, M, T, N> {}
 
-impl<'a, M: Meta, T, const N: usize> Deref for SmallCowVec<'a, M, T, N> {
+impl<'a, M: Meta, T, const N: usize> Deref for CalfVec<'a, M, T, N> {
 	type Target = [T];
 
 	fn deref(&self) -> &[T] {
@@ -225,7 +225,7 @@ impl<'a, M: Meta, T, const N: usize> Deref for SmallCowVec<'a, M, T, N> {
 	}
 }
 
-impl<'a, M: Meta, T, const N: usize> DerefMut for SmallCowVec<'a, M, T, N> {
+impl<'a, M: Meta, T, const N: usize> DerefMut for CalfVec<'a, M, T, N> {
 	fn deref_mut(&mut self) -> &mut [T] {
 		unsafe {
 			match self.capacity() {
@@ -244,7 +244,7 @@ impl<'a, M: Meta, T, const N: usize> DerefMut for SmallCowVec<'a, M, T, N> {
 	}
 }
 
-impl<'a, M: Meta, T, const N: usize> Extend<T> for SmallCowVec<'a, M, T, N> where T: Clone {
+impl<'a, M: Meta, T, const N: usize> Extend<T> for CalfVec<'a, M, T, N> where T: Clone {
 	#[inline]
 	fn extend<I: IntoIterator<Item = T>>(&mut self, iterator: I) {
 		self.to_mut().extend(iterator)
@@ -261,11 +261,11 @@ impl<'a, M: Meta, T, const N: usize> Extend<T> for SmallCowVec<'a, M, T, N> wher
 	// }
 }
 
-pub struct SmallMutVec<'v, 'a, M: Meta, T, const N: usize> {
-	vec: &'v mut SmallCowVec<'a, M, T, N>
+pub struct CalfVecMut<'v, 'a, M: Meta, T, const N: usize> {
+	vec: &'v mut CalfVec<'a, M, T, N>
 }
 
-impl<'v, 'a, M: Meta, T, const N: usize> SmallMutVec<'v, 'a, M, T, N> {
+impl<'v, 'a, M: Meta, T, const N: usize> CalfVecMut<'v, 'a, M, T, N> {
 	#[inline]
 	pub fn len(&self) -> usize {
 		self.vec.len()
@@ -406,7 +406,7 @@ impl<'v, 'a, M: Meta, T, const N: usize> SmallMutVec<'v, 'a, M, T, N> {
 	}
 }
 
-impl<'v, 'a, M: Meta, T, const N: usize> Deref for SmallMutVec<'v, 'a, M, T, N> {
+impl<'v, 'a, M: Meta, T, const N: usize> Deref for CalfVecMut<'v, 'a, M, T, N> {
 	type Target = [T];
 
 	fn deref(&self) -> &[T] {
@@ -414,13 +414,13 @@ impl<'v, 'a, M: Meta, T, const N: usize> Deref for SmallMutVec<'v, 'a, M, T, N> 
 	}
 }
 
-impl<'v, 'a, M: Meta, T, const N: usize> DerefMut for SmallMutVec<'v, 'a, M, T, N> {
+impl<'v, 'a, M: Meta, T, const N: usize> DerefMut for CalfVecMut<'v, 'a, M, T, N> {
 	fn deref_mut(&mut self) -> &mut [T] {
 		self.vec.deref_mut()
 	}
 }
 
-impl<'v, 'a, M: Meta, T, const N: usize> Extend<T> for SmallMutVec<'v, 'a, M, T, N> {
+impl<'v, 'a, M: Meta, T, const N: usize> Extend<T> for CalfVecMut<'v, 'a, M, T, N> {
 	#[inline]
 	fn extend<I: IntoIterator<Item = T>>(&mut self, iterator: I) {
 		let mut iterator = iterator.into_iter();

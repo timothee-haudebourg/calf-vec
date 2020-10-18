@@ -7,11 +7,11 @@ use std::{
 };
 use crate::generic::{
 	Meta,
-	SmallCowVec
+	CalfVec
 };
 
 pub struct FromUtf8Error<'a, M: Meta, const N: usize> {
-	bytes: SmallCowVec<'a, M, u8, N>,
+	bytes: CalfVec<'a, M, u8, N>,
 	error: str::Utf8Error
 }
 
@@ -25,12 +25,12 @@ impl<'a, M: Meta, const N: usize> FromUtf8Error<'a, M, N> {
 	}
 }
 
-pub struct SmallCowString<'a, M: Meta, const N: usize> {
-	vec: SmallCowVec<'a, M, u8, N>
+pub struct CalfString<'a, M: Meta, const N: usize> {
+	vec: CalfVec<'a, M, u8, N>
 }
 
-impl<'a, M: Meta, const N: usize> SmallCowString<'a, M, N> {
-	/// Converts a vector of bytes to a `SmallCowString`.
+impl<'a, M: Meta, const N: usize> CalfString<'a, M, N> {
+	/// Converts a vector of bytes to a `CalfString`.
 	///
 	/// A string ([`String`]) is made of bytes ([`u8`]), and a vector of bytes
 	/// ([`Vec<u8>`]) is made of bytes, so this function converts between the
@@ -53,10 +53,10 @@ impl<'a, M: Meta, const N: usize> SmallCowString<'a, M, N> {
 	/// Returns [`Err`] if the slice is not UTF-8 with a description as to why the
 	/// provided bytes are not UTF-8. The vector you moved in is also included.
 	#[inline]
-	pub fn from_utf8<V: Into<SmallCowVec<'a, M, u8, N>>>(vec: V) -> Result<SmallCowString<'a, M, N>, FromUtf8Error<'a, M, N>> {
+	pub fn from_utf8<V: Into<CalfVec<'a, M, u8, N>>>(vec: V) -> Result<CalfString<'a, M, N>, FromUtf8Error<'a, M, N>> {
 		let vec = vec.into();
 		match str::from_utf8(&vec) {
-			Ok(..) => Ok(SmallCowString { vec }),
+			Ok(..) => Ok(CalfString { vec }),
 			Err(e) => Err(FromUtf8Error { bytes: vec, error: e }),
 		}
 	}
@@ -73,7 +73,7 @@ impl<'a, M: Meta, const N: usize> SmallCowString<'a, M, N> {
 		self.vec.capacity()
 	}
 
-	/// Ensures that this `SmallCowString`'s capacity is at least `additional` bytes
+	/// Ensures that this `CalfString`'s capacity is at least `additional` bytes
 	/// larger than its length.
 	///
 	/// The capacity may be increased by more than `additional` bytes if it
@@ -86,13 +86,13 @@ impl<'a, M: Meta, const N: usize> SmallCowString<'a, M, N> {
 	///
 	/// Panics if the new capacity overflows [`usize`].
 	///
-	/// [`reserve_exact`]: SmallCowString::reserve_exact
+	/// [`reserve_exact`]: CalfString::reserve_exact
 	#[inline]
 	pub fn reserve(&mut self, additional: usize) {
 		self.vec.reserve(additional)
 	}
 
-	/// Appends the given [`char`] to the end of this `SmallCowString`.
+	/// Appends the given [`char`] to the end of this `CalfString`.
 	#[inline]
 	pub fn push(&mut self, ch: char) {
 		match ch.len_utf8() {
@@ -131,7 +131,7 @@ impl<'a, M: Meta, const N: usize> SmallCowString<'a, M, N> {
 	}
 }
 
-impl<'a, M: Meta, const N: usize> Deref for SmallCowString<'a, M, N> {
+impl<'a, M: Meta, const N: usize> Deref for CalfString<'a, M, N> {
 	type Target = str;
 
 	#[inline]
@@ -142,7 +142,7 @@ impl<'a, M: Meta, const N: usize> Deref for SmallCowString<'a, M, N> {
 	}
 }
 
-impl<'a, M: Meta, const N: usize> DerefMut for SmallCowString<'a, M, N> {
+impl<'a, M: Meta, const N: usize> DerefMut for CalfString<'a, M, N> {
 	#[inline]
 	fn deref_mut(&mut self) -> &mut str {
 		unsafe {
