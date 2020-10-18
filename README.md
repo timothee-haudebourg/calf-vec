@@ -8,7 +8,7 @@
 
 This crate provides the `CalfVec` data structure for small copy-on-write arrays.
 As long as the data is not written to, it is only borrowed.
-When owned, the data is stored on the stack as long as it is short small enough.
+When owned, the data is stored on the stack as long as it is small enough.
 Data is only moved on the heap as a last resort.
 This is basically the intersection between
 [`SmallVec`](https://crates.io/crates/smallvec) and
