@@ -55,6 +55,13 @@ union Data<T, const N: usize> {
 
 impl<T, const N: usize> Data<T, N> {
 	#[inline]
+	fn new() -> Data<T, N> {
+		Data {
+			ptr: ptr::null_mut()
+		}
+	}
+
+	#[inline]
 	unsafe fn drop_with<M: Meta>(&mut self, meta: M) {
 		match meta.capacity() {
 			Some(capacity) => {
@@ -123,6 +130,36 @@ impl<'a, M: Meta, T, const N: usize> Drop for CalfVec<'a, M, T, N> {
 }
 
 impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> {
+	/// Creates a new empty `CalfVec`.
+	// TODO make this function `const` as soon as the `const_fn` feature allows it.
+	#[inline]
+	pub fn new() -> CalfVec<'a, M, T, N> {
+		CalfVec {
+			meta: M::new(0, Some(N)),
+			data: Data::new(),
+			lifetime: PhantomData
+		}
+	}
+
+	/// Creates a new empty `CalfVec` with a particular capacity.
+	///
+	/// The actual capacity of the created `CalfVec` will be at least `N`.
+	#[inline]
+	pub fn with_capacity(capacity: usize) -> CalfVec<'a, M, T, N> {
+		if capacity <= N {
+			CalfVec::new()
+		} else {
+			let vec = Vec::with_capacity(capacity);
+			let (ptr, _, actual_capacity) = vec.into_raw_parts();
+
+			CalfVec {
+				meta: M::new(0, Some(actual_capacity)),
+				data: Data { ptr },
+				lifetime: PhantomData
+			}
+		}
+	}
+
 	/// Create a new `CalfVec` from borrowed data.
 	///
 	/// The input's data is not copied until it is accessed mutably.
@@ -373,6 +410,11 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> where T: Clone {
 		}
 	}
 
+	#[inline]
+	pub(crate) unsafe fn set_len(&mut self, len: usize) {
+		self.meta.set_len(len)
+	}
+
 	/// Shortens the vector, keeping the first `len` elements and dropping
 	/// the rest.
 	///
@@ -394,7 +436,7 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> where T: Clone {
 
 			let remaining_len = self.len() - len;
 			let s = ptr::slice_from_raw_parts_mut(self.as_mut_ptr().add(len), remaining_len);
-			self.meta.set_len(len);
+			self.set_len(len);
 			ptr::drop_in_place(s);
 		}
 	}
@@ -554,7 +596,7 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> where T: Clone {
 				// element.
 				ptr::write(p, element);
 			}
-			self.meta.set_len(len + 1);
+			self.set_len(len + 1);
 		}
 	}
 
@@ -585,7 +627,7 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> where T: Clone {
 				// Shift everything down to fill in that spot.
 				ptr::copy(ptr.offset(1), ptr, len - index - 1);
 			}
-			self.meta.set_len(len - 1);
+			self.set_len(len - 1);
 			ret
 		}
 	}
@@ -610,7 +652,7 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> where T: Clone {
 		self.reserve(count);
 		let len = self.len();
 		ptr::copy_nonoverlapping(other as *const T, self.as_mut_ptr().add(len), count);
-		self.meta.set_len(len + count);
+		self.set_len(len + count);
 	}
 
 	/// Clones and appends all elements in a slice to the `Vec`.
@@ -652,7 +694,7 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> where T: Clone {
 
 			let end = self.as_mut_ptr().add(self.len());
 			ptr::write(end, value);
-			self.meta.set_len(self.len()+1);
+			self.set_len(self.len()+1);
 		}
 	}
 
@@ -665,7 +707,7 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> where T: Clone {
 		} else {
 			self.own();
 			unsafe {
-				self.meta.set_len(self.len()-1);
+				self.set_len(self.len()-1);
 				Some(ptr::read(self.as_ptr().add(self.len())))
 			}
 		}
@@ -839,7 +881,7 @@ impl<'a, M: Meta, T, const N: usize> Extend<T> for CalfVec<'a, M, T, N> where T:
 			unsafe {
 				ptr::write(self.as_mut_ptr().add(len), element);
 				// NB can't overflow since we would have had to alloc the address space
-				self.meta.set_len(len + 1);
+				self.set_len(len + 1);
 			}
 		}
 	}
@@ -856,44 +898,61 @@ impl<'a, M: Meta, T, const N: usize> Extend<T> for CalfVec<'a, M, T, N> where T:
 }
 
 impl<'a, M: Meta, T: fmt::Debug, const N: usize> fmt::Debug for CalfVec<'a, M, T, N> {
+	#[inline]
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		fmt::Debug::fmt(&**self, f)
 	}
 }
 
 impl<'a, M: Meta, T, const N: usize> AsRef<CalfVec<'a, M, T, N>> for CalfVec<'a, M, T, N> {
+	#[inline]
 	fn as_ref(&self) -> &CalfVec<'a, M, T, N> {
 		self
 	}
 }
 
 impl<'a, M: Meta, T, const N: usize> AsMut<CalfVec<'a, M, T, N>> for CalfVec<'a, M, T, N> {
+	#[inline]
 	fn as_mut(&mut self) -> &mut CalfVec<'a, M, T, N> {
 		self
 	}
 }
 
 impl<'a, M: Meta, T, const N: usize> AsRef<[T]> for CalfVec<'a, M, T, N> {
+	#[inline]
 	fn as_ref(&self) -> &[T] {
 		self
 	}
 }
 
 impl<'a, M: Meta, T, const N: usize> AsMut<[T]> for CalfVec<'a, M, T, N> where T: Clone {
+	#[inline]
 	fn as_mut(&mut self) -> &mut [T] {
 		self
 	}
 }
 
 impl<'a, M: Meta, T, const N: usize> From<Vec<T>> for CalfVec<'a, M, T, N> {
+	#[inline]
 	fn from(v: Vec<T>) -> CalfVec<'a, M, T, N> {
 		CalfVec::owned(v)
 	}
 }
 
 impl<'a, M: Meta, T, const N: usize> From<&'a [T]> for CalfVec<'a, M, T, N> {
+	#[inline]
 	fn from(s: &'a [T]) -> CalfVec<'a, M, T, N> {
 		CalfVec::borrowed(s)
+	}
+}
+
+impl<'a, M: Meta, T, const N: usize> From<Cow<'a, [T]>> for CalfVec<'a, M, T, N> where T: Clone {
+	#[inline]
+	fn from(c: Cow<'a, [T]>) -> CalfVec<'a, M, T, N> {
+		match c {
+			Cow::Borrowed(s) => s.into(),
+			Cow::Owned(v) => v.into()
+		}
 	}
 }
 
