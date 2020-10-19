@@ -1,6 +1,6 @@
 [package]
 name = "calf-vec"
-version = "0.3.0-beta"
+version = "0.3.1-beta"
 authors = ["Timothée Haudebourg <author@haudebourg.net>"]
 edition = "2018"
 categories = ["data-structures"]
