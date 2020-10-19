@@ -56,6 +56,7 @@ impl<'a, M: Meta, const N: usize> FromUtf8Error<'a, M, N> {
 	/// an analogue to `FromUtf8Error`. See its documentation for more details
 	/// on using it.
 	///
+	/// [`Utf8Error`]: std::str::Utf8Error
 	/// [`std::str`]: core::str
 	/// [`&str`]: prim@str
 	pub fn utf8_error(&self) -> str::Utf8Error {
@@ -71,9 +72,9 @@ pub struct CalfString<'a, M: Meta, const N: usize> {
 impl<'a, M: Meta, const N: usize> CalfString<'a, M, N> {
 	/// Converts a vector of bytes to a `CalfString`.
 	///
-	/// A string ([`String`]) is made of bytes ([`u8`]), and a vector of bytes
-	/// ([`Vec<u8>`]) is made of bytes, so this function converts between the
-	/// two. Not all byte slices are valid `String`s, however: `String`
+	/// A string is made of bytes ([`u8`]), and a vector of bytes is made of bytes,
+	/// so this function converts between the
+	/// two. Not all byte slices are valid strings, however: `CalfString`
 	/// requires that it is valid UTF-8. `from_utf8()` checks to ensure that
 	/// the bytes are valid UTF-8, and then does the conversion.
 	///

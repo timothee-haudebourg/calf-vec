@@ -139,7 +139,7 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> {
 	/// println!("{:?}", calf); // prints "[4, 2, 3]"
 	/// ```
 	#[inline]
-	pub fn borrowed<B: AsRef<[T]>>(borrowed: &'a B) -> CalfVec<'a, M, T, N> {
+	pub fn borrowed<B: AsRef<[T]> + ?Sized>(borrowed: &'a B) -> CalfVec<'a, M, T, N> {
 		let slice = borrowed.as_ref();
 
 		CalfVec {
@@ -177,6 +177,85 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> {
 				data: Data { ptr },
 				lifetime: PhantomData
 			}
+		}
+	}
+
+	/// Try to convert this `CalfVec` into a borrowed slice.
+	///
+	/// Returns `Ok(slice)` if the data is borrowed, and `Err(self)` otherwise.
+	///
+	/// This is a cost-free operation.
+	#[inline]
+	pub fn try_into_slice(self) -> Result<&'a [T], Self> {
+		match self.capacity() {
+			Some(_) => Err(self),
+			None => unsafe {
+				Ok(std::slice::from_raw_parts(self.as_ptr(), self.len()))
+			}
+		}
+	}
+
+	// /// Try to convert this `CalfVec` into a fixed size array.
+	// ///
+	// /// Returns `Ok(slice)` if the data is owned and stored on the stack,
+	// /// and `Err(self)` otherwise.
+	// ///
+	// /// Note that some elements may be uninitialized if the `CalfVec` length is smaller than `N`.
+	// #[inline]
+	// pub fn try_into_array(self) -> Result<[std::mem::MaybeUninit<T>; N], Self> {
+	// 	match self.capacity() {
+	// 		Some(capacity) if capacity <= N => unsafe {
+	// 			let mut data = Data {
+	// 				ptr: ptr::null_mut()
+	// 			};
+	//
+	// 			std::mem::swap(&mut data, &mut self.data);
+	// 			std::mem::forget(self); // there is nothing left to drop in `self`, we can forget it.
+	// 			Ok(std::mem::transmute(data.stack))
+	// 		},
+	// 		_ => Err(self)
+	// 	}
+	// }
+
+	/// Try to convert this `CalfVec` into `Vec`.
+	///
+	/// Returns `Ok(vec)` if the data is owned and on the heap, and `Err(self)` otherwise.
+	///
+	/// This is a cost-free operation.
+	#[inline]
+	pub fn try_into_vec(self) -> Result<Vec<T>, Self> {
+		match self.capacity() {
+			Some(capacity) if capacity > N => unsafe {
+				let ptr = self.data.ptr;
+				let len = self.len();
+				std::mem::forget(self); // there is nothing left to drop in `self`, we can forget it.
+				Ok(Vec::from_raw_parts(ptr, len, capacity))
+			},
+			_ => Err(self)
+		}
+	}
+
+	/// Convert this `CalfVec` into `Vec`.
+	///
+	/// If the data is borrowed it will be cloned.
+	/// If the data is owned on the stack, it will be moved on the heap.
+	/// If the data is owned on the heap, then this is a cost-free operation.
+	#[inline]
+	pub fn into_vec(mut self) -> Vec<T> where T: Clone {
+		unsafe {
+			let capacity = self.own();
+			let len = self.len();
+			let vec = if capacity <= N {
+				let src = (*self.data.stack).as_mut_ptr();
+				let mut vec = Vec::with_capacity(len);
+				std::ptr::copy_nonoverlapping(src, vec.as_mut_ptr(), len);
+				vec
+			} else {
+				let ptr = self.data.ptr;
+				Vec::from_raw_parts(ptr, len, capacity)
+			};
+			std::mem::forget(self); // there is nothing left to drop in `self`, we can forget it.
+			vec
 		}
 	}
 
@@ -808,15 +887,15 @@ impl<'a, M: Meta, T, const N: usize> AsMut<[T]> for CalfVec<'a, M, T, N> where T
 	}
 }
 
+impl<'a, M: Meta, T, const N: usize> From<Vec<T>> for CalfVec<'a, M, T, N> {
+	fn from(v: Vec<T>) -> CalfVec<'a, M, T, N> {
+		CalfVec::owned(v)
+	}
+}
+
 impl<'a, M: Meta, T, const N: usize> From<&'a [T]> for CalfVec<'a, M, T, N> {
 	fn from(s: &'a [T]) -> CalfVec<'a, M, T, N> {
-		CalfVec {
-			meta: M::new(s.len(), None),
-			// it is safe to convert to *mut here
-			// because without capacity, the data won't be accessed mutably.
-			data: Data { ptr: s.as_ptr() as *mut T },
-			lifetime: PhantomData
-		}
+		CalfVec::borrowed(s)
 	}
 }
 
