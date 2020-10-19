@@ -1,6 +1,7 @@
 use std::{
 	str,
 	ptr,
+	fmt,
 	ops::{
 		Deref,
 		DerefMut
@@ -122,6 +123,9 @@ impl<'a, M: Meta, const N: usize> CalfString<'a, M, N> {
 	///
 	/// The inverse of this method is [`into_bytes`].
 	///
+	/// [`from_utf8_unchecked`]: CalfString::from_utf8_unchecked
+	/// [`into_bytes`]: CalfString::into_bytes
+	///
 	/// # Errors
 	///
 	/// Returns [`Err`] if the slice is not UTF-8 with a description as to why the
@@ -186,6 +190,14 @@ impl<'a, M: Meta, const N: usize> CalfString<'a, M, N> {
 	#[inline]
 	pub fn capacity(&self) -> Option<usize> {
 		self.vec.capacity()
+	}
+
+	/// Converts a `CalfString` into a [`CalfVec`] byte vector.
+	///
+	/// This consumes the `CalfString`, so we do not need to copy its contents.
+	#[inline]
+	pub fn into_bytes(self) -> CalfVec<'a, M, u8, N> {
+		self.vec
 	}
 
 	/// Truncates this `CalfString`, removing all contents.
@@ -518,5 +530,19 @@ impl<'a, M: Meta, const N: usize> From<Cow<'a, str>> for CalfString<'a, M, N> {
 			Cow::Borrowed(s) => s.into(),
 			Cow::Owned(s) => s.into()
 		}
+	}
+}
+
+impl<'a, M: Meta, const N: usize> fmt::Display for CalfString<'a, M, N> {
+	#[inline]
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		fmt::Display::fmt(&**self, f)
+	}
+}
+
+impl<'a, M: Meta, const N: usize> fmt::Debug for CalfString<'a, M, N> {
+	#[inline]
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		fmt::Debug::fmt(&**self, f)
 	}
 }
