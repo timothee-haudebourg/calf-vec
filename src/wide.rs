@@ -1,3 +1,4 @@
+#[derive(Clone, Copy)]
 pub struct Meta {
 	len: usize,
 	capacity: usize

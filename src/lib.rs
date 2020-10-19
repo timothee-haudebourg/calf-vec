@@ -2,6 +2,7 @@
 #![feature(untagged_unions)]
 #![feature(vec_into_raw_parts)]
 #![feature(slice_partition_dedup)]
+#![feature(shrink_to)]
 
 pub mod generic;
 pub mod string;

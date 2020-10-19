@@ -7,7 +7,8 @@ use std::{
 		DerefMut
 	},
 	borrow::Cow,
-	fmt
+	fmt,
+	cmp
 };
 
 /// Metadata representing the length and capacity of the array.
@@ -17,7 +18,7 @@ use std::{
 /// Then the maximum size/capacity depends on the bit-depth of the plateform.
 /// For 64-bit plateforms, this crate also provides [`lean::Meta`](crate::lean::Meta) that stores both the length
 /// and capacity on a single `usize`. As a result, the maximum size/capacity is [`std::u32::MAX`].
-pub trait Meta {
+pub trait Meta: Copy {
 	/// Maximum size/capacity of the array using this metadata format.
 	const MAX_LENGTH: usize;
 
@@ -50,6 +51,25 @@ union Data<T, const N: usize> {
 
 	/// Pointer to the data (aither borrowed, or owned on the heap).
 	ptr: *mut T
+}
+
+impl<T, const N: usize> Data<T, N> {
+	#[inline]
+	unsafe fn drop_with<M: Meta>(&mut self, meta: M) {
+		match meta.capacity() {
+			Some(capacity) => {
+				let len = meta.len();
+				if capacity <= N {
+					// stacked
+					ptr::drop_in_place(&mut (*self.stack)[0..len]);
+				} else {
+					// spilled
+					Vec::from_raw_parts(self.ptr, len, capacity);
+				}
+			},
+			None => ()
+		}
+	}
 }
 
 /// Contiguous growable array type that is either borrowed, stack allocated or heap allocated.
@@ -97,18 +117,8 @@ pub struct CalfVec<'a, M: Meta, T, const N: usize> {
 
 impl<'a, M: Meta, T, const N: usize> Drop for CalfVec<'a, M, T, N> {
 	fn drop(&mut self) {
-		match self.capacity() {
-			Some(capacity) => unsafe {
-				let len = self.len();
-				if capacity <= N {
-					// stacked
-					ptr::drop_in_place(&mut (*self.data.stack)[0..len]);
-				} else {
-					// spilled
-					Vec::from_raw_parts(self.data.ptr, len, capacity);
-				}
-			},
-			None => ()
+		unsafe {
+			self.data.drop_with(self.meta)
 		}
 	}
 }
@@ -321,25 +331,11 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> where T: Clone {
 	/// # Panics
 	///
 	/// Panics if the new capacity exceeds `M::MAX_LENGTH` bytes.
-	#[inline]
 	pub fn reserve(&mut self, additional: usize) {
 		let capacity = self.own();
 		unsafe {
 			let mut vec = if capacity <= N {
-				// time to spill!
-
-				let mut data = Data {
-					ptr: ptr::null_mut()
-				};
-
-				std::mem::swap(&mut data, &mut self.data);
-
-				let boxed_slice: Box<[T]> = Box::new(ManuallyDrop::into_inner(data.stack));
-				let mut vec = boxed_slice.into_vec();
-
-				self.data.ptr = vec.as_mut_ptr();
-
-				vec
+				self.spill()
 			} else {
 				Vec::from_raw_parts(self.data.ptr, self.len(), capacity)
 			};
@@ -349,6 +345,105 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> where T: Clone {
 			self.data.ptr = ptr;
 			self.meta.set_capacity(Some(capacity));
 		}
+	}
+
+	/// Reserves the minimum capacity for exactly `additional` more elements to
+	/// be inserted in the given `Vec<T>`. After calling `reserve_exact`,
+	/// capacity will be greater than or equal to `self.len() + additional`.
+	/// Does nothing if the capacity is already sufficient.
+	///
+	/// Note that the allocator may give the collection more space than it
+	/// requests. Therefore, capacity can not be relied upon to be precisely
+	/// minimal. Prefer `reserve` if future insertions are expected.
+	///
+	/// # Panics
+	///
+	/// Panics if the new capacity overflows `usize`.
+	pub fn reserve_exact(&mut self, additional: usize) {
+		let capacity = self.own();
+		unsafe {
+			let mut vec = if capacity <= N {
+				self.spill()
+			} else {
+				Vec::from_raw_parts(self.data.ptr, self.len(), capacity)
+			};
+
+			vec.reserve_exact(additional);
+			let (ptr, _, capacity) = vec.into_raw_parts();
+			self.data.ptr = ptr;
+			self.meta.set_capacity(Some(capacity));
+		}
+	}
+
+	/// Move the data on the stack.
+	///
+	/// The data must already be owned, and on the stack.
+	#[inline]
+	unsafe fn spill(&mut self) -> Vec<T> {
+		let mut data = Data {
+			ptr: ptr::null_mut()
+		};
+
+		std::mem::swap(&mut data, &mut self.data);
+
+		let boxed_slice: Box<[T]> = Box::new(ManuallyDrop::into_inner(data.stack));
+		let mut vec = boxed_slice.into_vec();
+
+		self.data.ptr = vec.as_mut_ptr();
+
+		vec
+	}
+
+	/// Shrinks the capacity of the vector with a lower bound.
+	///
+	/// The capacity will remain at least as large as `N`, the length
+	/// and the supplied value.
+	///
+	/// If the resulting capacity is equal to `N`, the data will be placed on the stack if it
+	/// is not already.
+	///
+	/// This function has no effect if the data is borrowed.
+	///
+	/// # Panics
+	///
+	/// Panics if the current capacity is smaller than the supplied
+	/// minimum capacity.
+	pub fn shrink_to(&mut self, min_capacity: usize) {
+		match self.capacity() {
+			Some(capacity) => unsafe {
+				assert!(capacity < min_capacity);
+				let len = self.len();
+				let new_capacity = cmp::max(len, min_capacity);
+
+				if new_capacity != capacity {
+					if new_capacity <= N {
+						if capacity > N {
+							// put back on the stack.
+							let ptr = self.data.ptr;
+							ptr::copy_nonoverlapping(ptr, (*self.data.stack).as_mut_ptr(), len);
+							Vec::from_raw_parts(ptr, 0, capacity); // drop the vec without touching its content.
+							self.meta.set_capacity(Some(N));
+						}
+					} else {
+						let mut vec = Vec::from_raw_parts(self.data.ptr, len, capacity);
+						vec.shrink_to(new_capacity);
+						let (ptr, _, actual_new_capacity) = vec.into_raw_parts();
+						self.data.ptr = ptr;
+						self.meta.set_capacity(Some(actual_new_capacity));
+					}
+				}
+			},
+			None => ()
+		}
+	}
+
+	/// Shrinks the capacity of the vector as much as possible.
+	///
+	/// It will drop down as close as possible to the length but the allocator
+	/// may still inform the vector that there is space for a few more elements.
+	#[inline]
+	pub fn shrink_to_fit(&mut self) {
+		self.shrink_to(self.len());
 	}
 
 	/// Inserts an element at position `index` within the vector, shifting all
@@ -554,6 +649,106 @@ impl<'a, M: Meta, T, const N: usize> DerefMut for CalfVec<'a, M, T, N> where T: 
 	}
 }
 
+impl<'v, 'a, M: Meta, T, const N: usize> IntoIterator for &'v CalfVec<'a, M, T, N> {
+	type Item = &'v T;
+	type IntoIter = std::slice::Iter<'v, T>;
+
+	fn into_iter(self) -> Self::IntoIter {
+		self.as_slice().into_iter()
+	}
+}
+
+impl<'v, 'a, M: Meta, T, const N: usize> IntoIterator for &'v mut CalfVec<'a, M, T, N> where T: Clone {
+	type Item = &'v mut T;
+	type IntoIter = std::slice::IterMut<'v, T>;
+
+	fn into_iter(self) -> Self::IntoIter {
+		self.as_mut_slice().into_iter()
+	}
+}
+
+pub union IntoIterData<T, const N: usize> {
+	stack: ManuallyDrop<[T; N]>,
+	vec: ManuallyDrop<std::vec::IntoIter<T>>
+}
+
+pub struct IntoIter<M: Meta, T, const N: usize> {
+	meta: M,
+	offset: usize,
+	data: IntoIterData<T, N>
+}
+
+impl<M: Meta, T, const N: usize> Iterator for IntoIter<M, T, N> {
+	type Item = T;
+
+	fn next(&mut self) -> Option<T> {
+		unsafe {
+			let capacity = self.meta.capacity().unwrap();
+			let item = if capacity <= N {
+				let i = self.offset;
+				if i < self.meta.len() {
+					self.offset += 1;
+					Some(ptr::read(self.data.stack.as_ptr().add(i)))
+				} else {
+					None
+				}
+			} else {
+				(*self.data.vec).next()
+			};
+
+			item
+		}
+	}
+}
+
+impl<M: Meta, T, const N: usize> Drop for IntoIter<M, T, N> {
+	fn drop(&mut self) {
+		unsafe {
+			let capacity = self.meta.capacity().unwrap();
+			if capacity <= N {
+				ptr::drop_in_place(&mut (*self.data.stack)[self.offset..self.meta.len()]); // only drop remaining elements.
+			} else {
+				ManuallyDrop::drop(&mut self.data.vec)
+			}
+		}
+	}
+}
+
+impl<'a, M: Meta, T, const N: usize> IntoIterator for CalfVec<'a, M, T, N> where T: Clone {
+	type Item = T;
+	type IntoIter = IntoIter<M, T, N>;
+
+	fn into_iter(mut self) -> Self::IntoIter {
+		unsafe {
+			let capacity = self.own();
+
+			let meta = self.meta;
+			let mut data = Data {
+				ptr: ptr::null_mut()
+			};
+			std::mem::swap(&mut data, &mut self.data);
+			std::mem::forget(self); // there is nothing left to drop in `self`, we can forget it.
+
+			let into_iter_data = if capacity <= N {
+				IntoIterData {
+					stack: data.stack
+				}
+			} else {
+				let vec = Vec::from_raw_parts(data.ptr, meta.len(), capacity);
+				IntoIterData {
+					vec: ManuallyDrop::new(vec.into_iter())
+				}
+			};
+
+			IntoIter {
+				meta,
+				offset: 0,
+				data: into_iter_data
+			}
+		}
+	}
+}
+
 impl<'a, M: Meta, T, const N: usize> Extend<T> for CalfVec<'a, M, T, N> where T: Clone {
 	#[inline]
 	fn extend<I: IntoIterator<Item = T>>(&mut self, iterator: I) {
@@ -624,6 +819,7 @@ impl<'a, M: Meta, T, const N: usize> From<&'a [T]> for CalfVec<'a, M, T, N> {
 		}
 	}
 }
+
 macro_rules! impl_slice_eq1 {
 	([$($vars:tt)*] $lhs:ty, $rhs:ty $(where $ty:ty: $bound:ident)?) => {
 		impl<$($vars)*> PartialEq<$rhs> for $lhs where A: PartialEq<B>, $($ty: $bound)? {

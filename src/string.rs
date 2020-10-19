@@ -131,6 +131,22 @@ impl<'a, M: Meta, const N: usize> CalfString<'a, M, N> {
 		self.vec.reserve(additional)
 	}
 
+	/// Ensures that this `CalfString`'s capacity is `additional` bytes
+	/// larger than its length.
+	///
+	/// Consider using the [`reserve`] method unless you absolutely know
+	/// better than the allocator.
+	///
+	/// [`reserve`]: CalfString::reserve
+	///
+	/// # Panics
+	///
+	/// Panics if the new capacity overflows `usize`.
+	#[inline]
+	pub fn reserve_exact(&mut self, additional: usize) {
+		self.vec.reserve_exact(additional)
+	}
+
 	/// Appends the given [`char`] to the end of this `CalfString`.
 	#[inline]
 	pub fn push(&mut self, ch: char) {
@@ -140,17 +156,35 @@ impl<'a, M: Meta, const N: usize> CalfString<'a, M, N> {
 		}
 	}
 
-	/// Returns a byte slice of this `String`'s contents.
+	/// Appends a given string slice onto the end of this `CalfString`.
+	#[inline]
+	pub fn push_str(&mut self, string: &str) {
+		self.vec.extend_from_slice(string.as_bytes())
+	}
+
+	/// Returns a byte slice of this `CalfString`'s contents.
 	///
 	/// The inverse of this method is [`from_utf8`].
 	///
-	/// [`from_utf8`]: String::from_utf8
+	/// [`from_utf8`]: CalfString::from_utf8
 	#[inline]
 	pub fn as_bytes(&self) -> &[u8] {
 		&self.vec
 	}
 
-	/// Shortens this `String` to the specified length.
+	/// Extracts a string slice containing the entire `CalfString`.
+	#[inline]
+	pub fn as_str(&self) -> &str {
+		self
+	}
+
+	/// Converts a `CalfString` into a mutable string slice.
+	#[inline]
+	pub fn as_mut_str(&mut self) -> &mut str {
+		self
+	}
+
+	/// Shortens this `CalfString` to the specified length.
 	///
 	/// If `new_len` is greater than the string's current length, this has no
 	/// effect.
