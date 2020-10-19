@@ -21,20 +21,23 @@
 //! use calf_vec::CalfVec;
 //!
 //! let slice = &[1, 2, 3];
-//! let mut calf: CalfVec<'_, T, 32> = CalfVec::borrowed(slice); // at this point, data is only borrowed.
+//! let mut calf: CalfVec<'_, u8, 32> = CalfVec::borrowed(slice); // at this point, data is only borrowed.
 //! calf[0]; // => 1
 //! calf[0] = 4; // because it is modified, the data is copied here.
-//! println!("{:?}", calf); // prints "[4, 2, 3]"
+//! assert_eq!(calf, [4, 2, 3])
 //! ```
 //!
 //! A `CalfVec` can also be directly created to own its data:
 //! ```rust
-//! let mut owned: CalfVec<'_, T, 32> = CalfVec::owned(vec![1, 2, 3]);
+//! # use calf_vec::CalfVec;
+//! let mut owned: CalfVec<'_, u8, 32> = CalfVec::owned(vec![1, 2, 3]);
 //! ```
 //! Here, since the owned buffer's capacity is smaller than 32 (given as parameter),
 //! it is stored on the stack.
 //! It will be moved on the heap only when necessary:
 //! ```rust
+//! # use calf_vec::CalfVec;
+//! # let mut owned: CalfVec<'_, u8, 32> = CalfVec::owned(vec![1, 2, 3]);
 //! owned.push(4);
 //! owned.push(5);
 //! // ...

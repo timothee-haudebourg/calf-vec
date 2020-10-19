@@ -92,17 +92,16 @@ impl<T, const N: usize> Data<T, N> {
 /// ```
 /// # use calf_vec::CalfVec;
 /// let slice = &[1, 2, 3];
-/// let mut calf = CalfVec::borrowed(slice); // at this point, data is only borrowed.
-/// calf[0]; // -> 1
-///
-/// calf[0] = 4; // because it is modified, the data is first copied.
-/// println!("{:?}", calf); // prints "[4, 2, 3]"
+/// let mut calf: CalfVec<'_, u8, 32> = CalfVec::borrowed(slice); // at this point, data is only borrowed.
+/// calf[0]; // => 1
+/// calf[0] = 4; // because it is modified, the data is copied here.
+/// assert_eq!(calf, [4, 2, 3])
 /// ```
 ///
 /// A `CalfVec` can also be directly created to own its data:
 /// ```
 /// # use calf_vec::CalfVec;
-/// let owned = CalfVec::owned(vec![1, 2, 3]);
+/// let owned: CalfVec<'_, u8, 32> = CalfVec::owned(vec![1, 2, 3]);
 /// ```
 pub struct CalfVec<'a, M: Meta, T, const N: usize> {
 	/// Metadata storing the length and capacity of the array.
@@ -132,11 +131,10 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> {
 	/// ```
 	/// # use calf_vec::CalfVec;
 	/// let slice = &[1, 2, 3];
-	/// let mut calf = CalfVec::borrowed(slice); // at this point, data is only borrowed.
-	/// calf[0]; // -> 1
-	///
-	/// calf[0] = 4; // because it is modified, the data is first copied.
-	/// println!("{:?}", calf); // prints "[4, 2, 3]"
+	/// let mut calf: CalfVec<'_, u8, 32> = CalfVec::borrowed(slice); // at this point, data is only borrowed.
+	/// calf[0]; // => 1
+	/// calf[0] = 4; // because it is modified, the data is copied here.
+	/// assert_eq!(calf, [4, 2, 3])
 	/// ```
 	#[inline]
 	pub fn borrowed<B: AsRef<[T]> + ?Sized>(borrowed: &'a B) -> CalfVec<'a, M, T, N> {
