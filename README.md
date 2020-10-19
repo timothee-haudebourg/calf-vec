@@ -6,19 +6,50 @@
 	<td><a href="https://github.com/timothee-haudebourg/calf-vec">Repository</a></td>
 </tr></table>
 
-This crate provides the `CalfVec` data structure for small copy-on-write arrays.
+This crate provides the
+[`CalfVec`](https://docs.rs/calf-vec/latest/calf_vec/generic/struct.CalfVec.html)
+data structure for small copy-on-write arrays.
 As long as the data is not written to, it is only borrowed.
 When owned, the data is stored on the stack as long as it is small enough.
 Data is only moved on the heap as a last resort.
 This is basically the intersection between
 [`SmallVec`](https://crates.io/crates/smallvec) and
-[`Cow`](https://doc.rust-lang.org/std/borrow/enum.Cow.html) ("small cow" = "calf").
-Additionally this crate provides a `CalfString` for small copy-on-write strings
+[`Cow`](https://doc.rust-lang.org/std/borrow/enum.Cow.html) (`Small` + `Cow` = `Calf`).
+Additionally this crate provides a
+[`CalfString`](https://docs.rs/calf-vec/latest/calf_vec/string/struct.CalfString.html)
+for small copy-on-write strings
 based on `CalfVec`.
 
 ## Basic usage
 
-TODO
+A `CalfVec` either borrows or owns its data.
+You can start by creating a `CalfVec` from a slice.
+It will only be copied when the `CalfVec` is modified.
+```rust
+use calf_vec::CalfVec;
+
+let slice = &[1, 2, 3];
+let mut calf: CalfVec<'_, T, 32> = CalfVec::borrowed(slice); // at this point, data is only borrowed.
+calf[0]; // => 1
+calf[0] = 4; // because it is modified, the data is copied here.
+println!("{:?}", calf); // prints "[4, 2, 3]"
+```
+
+A `CalfVec` can also be directly created to own its data:
+```rust
+let mut owned: CalfVec<'_, T, 32> = CalfVec::owned(vec![1, 2, 3]);
+```
+Here, since the owned buffer's capacity is smaller than 32 (given as parameter),
+it is stored on the stack.
+It will be moved on the heap only when necessary:
+```rust
+owned.push(4);
+owned.push(5);
+// ...
+owned.push(31);
+owned.push(32); // <- here the buffer's capacity now exceeds the given limit (32).
+                //    it is hence moved on the heap, transparently.
+```
 
 ## License
 
