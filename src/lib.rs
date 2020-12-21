@@ -57,6 +57,7 @@
 #![feature(untagged_unions)]
 #![feature(vec_into_raw_parts)]
 
+pub mod raw;
 pub mod generic;
 pub mod string;
 pub mod wide;

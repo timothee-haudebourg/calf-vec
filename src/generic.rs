@@ -29,13 +29,10 @@ use std::{
 	collections::TryReserveError,
 	borrow::Cow
 };
-
-enum AllocInit {
-	/// The contents of the new memory are uninitialized.
-	Uninitialized,
-	/// The new memory is guaranteed to be zeroed.
-	Zeroed,
-}
+use crate::raw::{
+	self,
+	RawCalfVec
+};
 
 /// Metadata representing the length and capacity of the array.
 ///
@@ -44,93 +41,14 @@ enum AllocInit {
 /// Then the maximum size/capacity depends on the bit-depth of the plateform.
 /// For 64-bit plateforms, this crate also provides [`lean::Meta`](crate::lean::Meta) that stores both the length
 /// and capacity on a single `usize`. As a result, the maximum size/capacity is [`std::u32::MAX`].
-pub trait Meta: Copy {
-	/// Maximum size/capacity of the array using this metadata format.
-	const MAX_LENGTH: usize;
-
+pub unsafe trait Meta: raw::Meta {
 	/// Create a new metadata from an array's length and capacity (if any).
 	fn new(len: usize, capacity: Option<usize>) -> Self;
 
 	/// Get the length of the array.
 	fn len(&self) -> usize;
-
-	/// Get the capacity of the buffer, if any.
-	///
-	/// The capacity is only defined on owned buffers.
-	fn capacity(&self) -> Option<usize>;
-
 	/// Set the new length of the array.
 	fn set_len(&mut self, len: usize);
-
-	/// Set the new capacity of the buffer.
-	fn set_capacity(&mut self, capacity: Option<usize>);
-}
-
-/// Inner data storage.
-///
-/// We use an union here since the actual type depends on the where the data is stored.
-/// If the data is owned and on the stack, then the relevent field is `stack`.
-/// If the data is borrowed or spilled, the the relevent field is `ptr`.
-union Data<T, const N: usize> {
-	/// Data stored on the stack.
-	stack: ManuallyDrop<[MaybeUninit<T>; N]>,
-
-	/// Pointer to the data (either borrowed, or owned on the heap).
-	ptr: NonNull<T>
-}
-
-impl<T, const N: usize> Data<T, N> {
-	#[inline]
-	const fn dangling() -> Data<T, N> {
-		Data {
-			ptr: NonNull::dangling()
-		}
-	}
-
-	#[inline]
-	fn new(init: AllocInit) -> Data<T, N> {
-		match init {
-			AllocInit::Uninitialized => {
-				Data {
-					stack: ManuallyDrop::new(
-						// SAFETY: An uninitialized `[MaybeUninit<_>; N]` is valid.
-						unsafe { MaybeUninit::<[MaybeUninit<T>; N]>::uninit().assume_init() }
-					)
-				}
-			},
-			AllocInit::Zeroed => {
-				Data {
-					stack: ManuallyDrop::new(
-						// SAFETY: An uninitialized `[MaybeUninit<_>; N]` is valid.
-						unsafe { MaybeUninit::<[MaybeUninit<T>; N]>::zeroed().assume_init() }
-					)
-				}
-			}
-		}
-	}
-
-	#[inline]
-	unsafe fn drop_with<M: Meta, A: Allocator>(&mut self, meta: M, alloc: &A) {
-		match meta.capacity() {
-			Some(capacity) => {
-				let len = meta.len();
-				if capacity <= N { // stacked
-					// drop every element.
-					ptr::drop_in_place(&mut (*self.stack)[0..len]);
-				} else { // spilled
-					// drop every element.
-					ptr::drop_in_place(ptr::slice_from_raw_parts_mut(self.ptr.as_ptr(), len)); 
-
-					// free memory.
-					let align = std::mem::align_of::<T>();
-					let size = std::mem::size_of::<T>() * capacity;
-					let layout = std::alloc::Layout::from_size_align_unchecked(size, align);
-					alloc.deallocate(self.ptr.cast(), layout)
-				}
-			},
-			None => () // borrowed
-		}
-	}
 }
 
 /// Contiguous growable array type that is either borrowed, stack allocated or heap allocated.
@@ -165,14 +83,8 @@ impl<T, const N: usize> Data<T, N> {
 /// let owned: CalfVec<'_, u8, 32> = CalfVec::owned(vec![1, 2, 3]);
 /// ```
 pub struct CalfVec<'a, M: Meta, T, A: Allocator, const N: usize> {
-	/// Metadata storing the length and capacity of the array.
-	meta: M,
-
-	/// The actual data (or a pointer to the actual data).
-	data: Data<T, N>,
-
-	/// Allocator.
-	alloc: A,
+	/// Raw vec.
+	raw: RawCalfVec<M, T, A, N>,
 
 	/// Remembers the lifetime of the data if it is borrowed.
 	lifetime: PhantomData<&'a T>
@@ -180,9 +92,17 @@ pub struct CalfVec<'a, M: Meta, T, A: Allocator, const N: usize> {
 
 impl<'a, M: Meta, T, A: Allocator, const N: usize> Drop for CalfVec<'a, M, T, A, N> {
 	fn drop(&mut self) {
-		unsafe {
-			self.data.drop_with(self.meta, &self.alloc)
+		match self.capacity() {
+			Some(_) => unsafe {
+				let len = self.raw.meta().len();
+
+				// drop every element.
+				ptr::drop_in_place(ptr::slice_from_raw_parts_mut(self.raw.owned_as_mut_ptr(), len));
+			},
+			None => ()
 		}
+
+		// NOTE: deallocation is handled by `RawCalfVec`.
 	}
 }
 
@@ -224,58 +144,14 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, Global, N> {
 }
 
 impl<'a, M: Meta, T, A: Allocator, const N: usize> CalfVec<'a, M, T, A, N> {
-	/// Initialize a new `CalfVec` of capacity `N` on the stack.
-	fn init_in(init: AllocInit, alloc: A) -> Self {
-		CalfVec {
-			meta: M::new(0, Some(N)),
-			data: Data::new(init),
-			alloc,
-			lifetime: PhantomData
-		}
-	}
-
 	/// Constructs a new, empty `CalfVec<M, T, A, N>`.
 	///
 	/// The vector will not allocate until more than `N` elements are pushed onto it.
 	#[inline]
 	pub fn new_in(alloc: A) -> CalfVec<'a, M, T, A, N> {
 		CalfVec {
-			meta: M::new(0, Some(N)),
-			data: Data::new(AllocInit::Uninitialized),
-			alloc,
+			raw: RawCalfVec::new_in(alloc),
 			lifetime: PhantomData
-		}
-	}
-
-	fn allocate_in(capacity: usize, init: AllocInit, alloc: A) -> Self {
-		if mem::size_of::<T>() == 0 {
-			Self::new_in(alloc)
-		} else {
-			let meta = M::new(0, Some(capacity));
-
-			let layout = match Layout::array::<T>(capacity) {
-				Ok(layout) => layout,
-				Err(_) => capacity_overflow(),
-			};
-			match alloc_guard(layout.size()) {
-				Ok(_) => {}
-				Err(_) => capacity_overflow(),
-			}
-			let result = match init {
-				AllocInit::Uninitialized => alloc.allocate(layout),
-				AllocInit::Zeroed => alloc.allocate_zeroed(layout),
-			};
-			let ptr = match result {
-				Ok(ptr) => ptr,
-				Err(_) => handle_alloc_error(layout),
-			};
-
-			Self {
-				meta,
-				data: Data { ptr: ptr.cast() },
-				alloc,
-				lifetime: PhantomData
-			}
 		}
 	}
 
@@ -283,10 +159,9 @@ impl<'a, M: Meta, T, A: Allocator, const N: usize> CalfVec<'a, M, T, A, N> {
 	/// allocator for the returned `RawVec`.
 	#[inline]
 	pub fn with_capacity_in(capacity: usize, alloc: A) -> Self {
-		if capacity <= N {
-			Self::init_in(AllocInit::Uninitialized, alloc)
-		} else {
-			Self::allocate_in(capacity, AllocInit::Uninitialized, alloc)
+		CalfVec {
+			raw: RawCalfVec::with_capacity_in(capacity, alloc),
+			lifetime: PhantomData
 		}
 	}
 
@@ -294,10 +169,9 @@ impl<'a, M: Meta, T, A: Allocator, const N: usize> CalfVec<'a, M, T, A, N> {
 	/// of allocator for the returned `RawVec`.
 	#[inline]
 	pub fn with_capacity_zeroed_in(capacity: usize, alloc: A) -> Self {
-		if capacity <= N {
-			Self::init_in(AllocInit::Zeroed, alloc)
-		} else {
-			Self::allocate_in(capacity, AllocInit::Zeroed, alloc)
+		CalfVec {
+			raw: RawCalfVec::with_capacity_zeroed_in(capacity, alloc),
+			lifetime: PhantomData
 		}
 	}
 
@@ -306,9 +180,7 @@ impl<'a, M: Meta, T, A: Allocator, const N: usize> CalfVec<'a, M, T, A, N> {
 		let slice = borrowed.as_ref();
 
 		CalfVec {
-			meta: M::new(slice.len(), None),
-			data: Data { ptr: unsafe { NonNull::new_unchecked(slice.as_ptr() as *mut T) } },
-			alloc,
+			raw: RawCalfVec::borrowed_in(unsafe { NonNull::new_unchecked(slice.as_ptr() as *mut T) }, alloc),
 			lifetime: PhantomData
 		}
 	}
@@ -318,63 +190,37 @@ impl<'a, M: Meta, T, A: Allocator, const N: usize> CalfVec<'a, M, T, A, N> {
 	/// The input is consumed and stored either on the stack if it does not exceed the
 	/// capacity parameter `N`, or on the heap otherwise.
 	#[inline]
-	pub fn owned<O: Into<Vec<T, A>>>(owned: O) -> CalfVec<'a, M, T, A, N> where A: Clone {
+	pub fn owned<O: Into<Vec<T, A>>>(owned: O) -> CalfVec<'a, M, T, A, N> {
 		let vec = owned.into();
-		let alloc = vec.allocator().clone();
-		let (ptr, len, capacity) = vec.into_raw_parts();
+		let (ptr, len, capacity, alloc) = vec.into_raw_parts_with_alloc();
 
-		if capacity <= N {
-			// put on stack
-			unsafe {
-				let mut data = Data::dangling();
-				std::ptr::copy_nonoverlapping(ptr, (*data.stack).as_mut_ptr().cast(), len);
+		let raw = unsafe {
+			if capacity <= N {
+				// put on stack.
+				let mut raw = RawCalfVec::with_capacity_in(N, alloc);
+				std::ptr::copy_nonoverlapping(ptr, raw.owned_as_mut_ptr(), len);
 
-				CalfVec {
-					meta: M::new(len, Some(N)),
-					data,
-					alloc,
-					lifetime: PhantomData
-				}
+				// deallocate heap buffer.
+				let layout = Layout::array::<T>(capacity).unwrap();
+				raw.allocator().deallocate(NonNull::new_unchecked(ptr).cast(), layout);
+
+				raw
+			} else {
+				// put on heap.
+				RawCalfVec::spilled_in(NonNull::new_unchecked(ptr), capacity, alloc)
 			}
-		} else {
-			// put on heap
-			CalfVec {
-				meta: M::new(len, Some(capacity)),
-				data: Data { ptr: unsafe { NonNull::new_unchecked(ptr) } },
-				alloc,
-				lifetime: PhantomData
-			}
+		};
+
+		CalfVec {
+			raw,
+			lifetime: PhantomData
 		}
 	}
 
 	/// Returns a reference to the underlying allocator.
 	#[inline]
 	pub fn allocator(&self) -> &A {
-		&self.alloc
-	}
-
-	/// Returns the current allocated memory and layout.
-	///
-	/// Returns `None` if the data is borrowed, on the stack,
-	/// or is the size of `T` is 0.
-	fn current_memory(&self) -> Option<(NonNull<u8>, Layout)> {
-		match self.capacity() {
-			None => None,
-			Some(capacity) => {
-				if capacity <= N {
-					None
-				} else {
-					// We have an allocated chunk of memory, so we can bypass runtime
-					// checks to get our current layout.
-					unsafe {
-						let align = mem::align_of::<T>();
-						let size = mem::size_of::<T>() * capacity;
-						let layout = Layout::from_size_align_unchecked(size, align);
-						Some((self.data.ptr.cast().into(), layout))
-					}
-				}
-			}
-		}
+		self.raw.allocator()
 	}
 
 	/// Try to convert this `CalfVec` into a borrowed slice.
@@ -414,6 +260,18 @@ impl<'a, M: Meta, T, A: Allocator, const N: usize> CalfVec<'a, M, T, A, N> {
 	// 	}
 	// }
 
+	#[inline]
+	pub fn into_raw(self) -> RawCalfVec<M, T, A, N> {
+		let raw = unsafe { ptr::read(&self.raw) };
+		std::mem::forget(self);
+		raw
+	}
+
+	#[inline]
+	pub fn into_raw_parts_with_alloc(self) -> (M, raw::Data<T, N>, A) {
+		self.into_raw().into_raw_parts_with_alloc()
+	}
+
 	/// Try to convert this `CalfVec` into `Vec`.
 	///
 	/// Returns `Ok(vec)` if the data is owned and on the heap, and `Err(self)` otherwise.
@@ -423,11 +281,8 @@ impl<'a, M: Meta, T, A: Allocator, const N: usize> CalfVec<'a, M, T, A, N> {
 	pub fn try_into_vec(self) -> Result<Vec<T, A>, Self> {
 		match self.capacity() {
 			Some(capacity) if capacity > N => unsafe {
-				let alloc = ptr::read(&self.alloc); // this is safe because `self.alloc` is never used ever after.
-				let ptr = self.data.ptr;
-				let len = self.len();
-				std::mem::forget(self); // there is nothing left to drop in `self`, we can forget it.
-				Ok(Vec::from_raw_parts_in(ptr.as_ptr(), len, capacity, alloc))
+				let (meta, data, alloc) = self.into_raw_parts_with_alloc();
+				Ok(Vec::from_raw_parts_in(data.ptr.as_ptr(), meta.len(), capacity, alloc))
 			},
 			_ => Err(self)
 		}
@@ -442,18 +297,19 @@ impl<'a, M: Meta, T, A: Allocator, const N: usize> CalfVec<'a, M, T, A, N> {
 	pub fn into_vec(mut self) -> Vec<T, A> where T: Clone {
 		unsafe {
 			let capacity = self.own();
-			let len = self.len();
-			let alloc = ptr::read(&self.alloc); // this is safe because `self.alloc` is never used ever after.
+			let (meta, data, alloc) = self.into_raw_parts_with_alloc();
+			let len = meta.len();
+
 			let vec = if capacity <= N {
-				let src = (*self.data.stack).as_mut_ptr() as *mut T;
+				let src = (*data.stack).as_ptr() as *const T;
+
 				let mut vec = Vec::with_capacity_in(len, alloc);
 				std::ptr::copy_nonoverlapping(src, vec.as_mut_ptr(), len);
 				vec
 			} else {
-				let ptr = self.data.ptr;
-				Vec::from_raw_parts_in(ptr.as_ptr(), len, capacity, alloc)
+				Vec::from_raw_parts_in(data.ptr.as_ptr(), len, capacity, alloc)
 			};
-			std::mem::forget(self); // there is nothing left to drop in `self`, we can forget it.
+			
 			vec
 		}
 	}
@@ -470,18 +326,7 @@ impl<'a, M: Meta, T, A: Allocator, const N: usize> CalfVec<'a, M, T, A, N> {
 	/// derived from it. If you need to mutate the contents of the slice, use [`as_mut_ptr`](#as_mut_ptr).
 	#[inline]
 	pub fn as_ptr(&self) -> *const T {
-		unsafe {
-			match self.capacity() {
-				Some(capacity) => {
-					if capacity <= N {
-						(*self.data.stack).as_ptr() as *const T
-					} else {
-						self.data.ptr.as_ptr()
-					}
-				},
-				None => self.data.ptr.as_ptr()
-			}
-		}
+		self.raw.as_ptr()
 	}
 
 	/// Returns an unsafe mutable pointer to the owned vector's buffer.
@@ -489,12 +334,7 @@ impl<'a, M: Meta, T, A: Allocator, const N: usize> CalfVec<'a, M, T, A, N> {
 	/// Same as [`as_mut_ptr`] but the caller must ensure that the data is owned by the vector.
 	#[inline]
 	pub unsafe fn owned_as_mut_ptr(&mut self) -> *mut T {
-		let capacity = self.capacity().unwrap();
-		if capacity <= N {
-			(*self.data.stack).as_mut_ptr() as *mut T
-		} else {
-			self.data.ptr.as_ptr()
-		}
+		self.raw.owned_as_mut_ptr()
 	}
 
 	/// Extracts a slice containing the entire vector.
@@ -532,22 +372,18 @@ impl<'a, M: Meta, T, A: Allocator, const N: usize> CalfVec<'a, M, T, A, N> {
 	/// Returns the length of the array.
 	#[inline]
 	pub fn len(&self) -> usize {
-		self.meta.len()
+		self.raw.meta().len()
 	}
 
 	#[inline]
 	pub unsafe fn set_len(&mut self, len: usize) {
-		self.meta.set_len(len)
+		self.raw.meta_mut().set_len(len)
 	}
 
 	/// Returns the capacity of the owned buffer, or `None` if the data is only borrowed.
 	#[inline]
 	pub fn capacity(&self) -> Option<usize> {
-		if mem::size_of::<T>() == 0 {
-			Some(usize::MAX)
-		} else {
-			self.meta.capacity()
-		}
+		self.raw.capacity()
 	}
 
 	/// Returns the remaining spare capacity of the vector as a slice of
@@ -563,12 +399,7 @@ impl<'a, M: Meta, T, A: Allocator, const N: usize> CalfVec<'a, M, T, A, N> {
 		let len = self.len();
 		match self.capacity() {
 			Some(capacity) => unsafe {
-				let ptr = if capacity <= N {
-					(*self.data.stack).as_mut_ptr()
-				} else {
-					self.data.ptr.as_ptr() as *mut MaybeUninit<T>
-				};
-
+				let ptr = self.owned_as_mut_ptr() as *mut MaybeUninit<T>;
 				std::slice::from_raw_parts_mut(ptr.add(len), capacity - len)
 			},
 			None => {
@@ -585,9 +416,9 @@ impl<'a, M: Meta, T, A: Allocator, const N: usize> CalfVec<'a, M, T, A, N> where
 			Some(capacity) => capacity,
 			None => unsafe { // copy time!
 				let len = self.len();
-				let slice = std::slice::from_raw_parts(self.data.ptr.as_ptr(), len);
+				let slice = std::slice::from_raw_parts(self.raw.as_ptr(), len);
 
-				let alloc = ptr::read(&self.alloc); // this is safe because `self.alloc` is never used ever after.
+				let alloc = ptr::read(self.allocator()); // this is safe because `self.alloc` is never used ever after.
 				let mut vec = T::to_calf_vec(slice, alloc);
 				std::mem::swap(&mut vec, self);
 				std::mem::forget(vec);
@@ -606,13 +437,7 @@ impl<'a, M: Meta, T, A: Allocator, const N: usize> CalfVec<'a, M, T, A, N> where
 	#[inline]
 	pub fn as_mut_ptr(&mut self) -> *mut T {
 		let capacity = self.own();
-		unsafe {
-			if capacity <= N {
-				(*self.data.stack).as_mut_ptr() as *mut T
-			} else {
-				self.data.ptr.as_ptr()
-			}
-		}
+		unsafe { self.raw.owned_as_mut_ptr_with_capacity(capacity) }
 	}
 
 	/// Extracts a mutable slice of the entire vector.
@@ -654,25 +479,11 @@ impl<'a, M: Meta, T, A: Allocator, const N: usize> CalfVec<'a, M, T, A, N> where
 
 	/// The same as `reserve`, but returns on errors instead of panicking or aborting.
 	pub fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError> {
-		unsafe {
-			if self.needs_to_grow(additional) {
-				match self.capacity() {
-					Some(capacity) => {
-						if capacity <= N { // on stack
-							self.spill_amortized(additional)
-						} else { // spilled
-							// Safe because we just checked that the data is spilled.
-							self.grow_amortized(additional)
-						}
-					},
-					None => { // borrowed
-						self.import_amortized(additional)
-					}
-				}
-			} else {
-				Ok(())
-			}
+		if let Some(dst) = self.raw.try_reserve(self.len(), additional)? {
+			panic!("TODO") // copy to buffer.
 		}
+
+		Ok(())
 	}
 
 	/// Reserves capacity for at least `additional` more elements to be inserted
@@ -706,64 +517,16 @@ impl<'a, M: Meta, T, A: Allocator, const N: usize> CalfVec<'a, M, T, A, N> where
 
 	/// The same as `reserve`, but returns on errors instead of panicking or aborting.
 	pub fn try_reserve_exact(&mut self, additional: usize) -> Result<(), TryReserveError> {
-		unsafe {
-			if self.needs_to_grow(additional) {
-				match self.capacity() {
-					Some(capacity) => {
-						if capacity <= N { // on stack
-							self.spill_exact(additional)
-						} else { // spilled
-							// Safe because we just checked that the data is spilled.
-							self.grow_exact(additional)
-						}
-					},
-					None => { // borrowed
-						self.import_exact(additional)
-					}
-				}
-			} else {
-				Ok(())
-			}
+		if let Some(dst) = self.raw.try_reserve_exact(self.len(), additional)? {
+			panic!("TODO") // copy to buffer.
 		}
+
+		Ok(())
 	}
 
 	/// The same as `shrink_to`, but returns on errors instead of panicking or aborting.
 	pub fn try_shrink_to(&mut self, min_capacity: usize) -> Result<(), TryReserveError> {
-		let len = self.len();
-		match self.capacity() {
-			Some(capacity) => unsafe {
-				assert!(min_capacity <= capacity);
-
-				let new_capacity = cmp::max(len, min_capacity);
-
-				if capacity <= N { // stacked.
-					Ok(()) // nothing to do.
-				} else { // spilled.
-					if new_capacity <= N { // put back on stack.
-						// move to stack.
-						let ptr = self.data.ptr;
-						let src = ptr.as_ptr();
-						let dst = (*self.data.stack).as_mut_ptr() as *mut T;
-						ptr::copy_nonoverlapping(src, dst, len);
-						self.meta.set_capacity(Some(N));
-
-						// free allocated memory.
-						let align = std::mem::align_of::<T>();
-						let size = std::mem::size_of::<T>() * capacity;
-						let layout = std::alloc::Layout::from_size_align_unchecked(size, align);
-						self.alloc.deallocate(ptr.cast(), layout);
-
-						Ok(())
-					} else { // shrink allocated memory.
-						self.shrink(min_capacity)
-					}
-				}
-			},
-			None => {
-				assert!(min_capacity <= len);
-				Ok(())
-			}
-		}
+		self.raw.try_shrink_to(min_capacity)
 	}
 
 	/// Shrinks the capacity of the vector with a lower bound.
@@ -781,7 +544,7 @@ impl<'a, M: Meta, T, A: Allocator, const N: usize> CalfVec<'a, M, T, A, N> where
 	/// Panics if the current capacity is smaller than the supplied
 	/// minimum capacity.
 	pub fn shrink_to(&mut self, min_capacity: usize) {
-		handle_reserve(self.try_shrink_to(min_capacity))
+		self.raw.shrink_to(min_capacity)
 	}
 
 	/// Shrinks the capacity of the vector as much as possible.
@@ -998,229 +761,6 @@ impl<'a, M: Meta, T, A: Allocator, const N: usize> CalfVec<'a, M, T, A, N> where
 }
 
 impl<'a, M: Meta, T, A: Allocator, const N: usize> CalfVec<'a, M, T, A, N> where T: Clone {
-	/// Returns if the buffer needs to grow to fulfill the needed extra capacity.
-	/// Mainly used to make inlining reserve-calls possible without inlining `grow`.
-	fn needs_to_grow(&self, additional: usize) -> bool {
-		match self.capacity() {
-			Some(capacity) => {
-				additional > capacity.wrapping_sub(self.len())
-			},
-			None => true
-		}
-	}
-
-	fn capacity_from_bytes(excess: usize) -> usize {
-		debug_assert_ne!(mem::size_of::<T>(), 0);
-		excess / mem::size_of::<T>()
-	}
-
-	fn set_ptr(&mut self, ptr: NonNull<[u8]>) {
-		self.data.ptr = ptr.cast();
-		self.meta.set_capacity(Some(Self::capacity_from_bytes(ptr.len())));
-	}
-
-	/// Import the borrowed data.
-	/// 
-	/// ## Safety
-	/// 
-	/// The caller must ensure that the data is indeed borrowed.
-	unsafe fn import_amortized(&mut self, additional: usize) -> Result<(), TryReserveError> {
-		debug_assert!(self.is_borrowed());
-
-		let required_capacity = self.len().checked_add(additional).ok_or(TryReserveError::CapacityOverflow)?;
-		let capacity = cmp::max(self.len() * 2, required_capacity);
-
-		let alloc = ptr::read(&self.alloc); // this is safe because `self.alloc` is never used ever after.
-		let mut vec: Self = T::to_calf_vec_with_capacity(self.as_slice(), capacity, alloc);
-		mem::swap(self, &mut vec);
-		mem::forget(vec);
-
-		Ok(())
-	}
-
-	unsafe fn import_exact(&mut self, additional: usize) -> Result<(), TryReserveError> {
-		debug_assert!(self.is_borrowed());
-
-		let capacity = self.len().checked_add(additional).ok_or(TryReserveError::CapacityOverflow)?;
-
-		let alloc = ptr::read(&self.alloc); // this is safe because `self.alloc` is never used ever after.
-		let mut vec: Self = T::to_calf_vec_with_capacity(self.as_slice(), capacity, alloc);
-		mem::swap(self, &mut vec);
-		mem::forget(vec);
-
-		Ok(())
-	}
-
-	/// Spill the data stored on the stack into the heap with some additional capacity.
-	/// 
-	/// ## Safety
-	/// 
-	/// The caller must ensure that the data is indeed stored in the stack.
-	unsafe fn spill_amortized(&mut self, additional: usize) -> Result<(), TryReserveError> {
-		debug_assert!(self.is_owned() && !self.is_spilled());
-
-		let len = self.len();
-		let required_capacity = len.checked_add(additional).ok_or(TryReserveError::CapacityOverflow)?;
-		let capacity = cmp::max(len * 2, cmp::max(required_capacity, N+1));
-
-		let layout = match Layout::array::<T>(capacity) {
-			Ok(layout) => layout,
-			Err(_) => capacity_overflow(),
-		};
-		match alloc_guard(layout.size()) {
-			Ok(_) => {}
-			Err(_) => capacity_overflow(),
-		}
-		let result = self.alloc.allocate(layout);
-		let dst = match result {
-			Ok(ptr) => ptr,
-			Err(_) => handle_alloc_error(layout),
-		};
-
-		let src = self.as_slice();
-		src.as_ptr().copy_to_nonoverlapping(dst.as_ptr().cast(), N);
-
-		self.set_ptr(dst);
-
-		Ok(())
-	}
-
-	unsafe fn spill_exact(&mut self, additional: usize) -> Result<(), TryReserveError> {
-		debug_assert!(self.is_owned() && !self.is_spilled());
-
-		let len = self.len();
-		let capacity = cmp::max(len.checked_add(additional).ok_or(TryReserveError::CapacityOverflow)?, N+1);
-
-		let layout = match Layout::array::<T>(capacity) {
-			Ok(layout) => layout,
-			Err(_) => capacity_overflow(),
-		};
-		match alloc_guard(layout.size()) {
-			Ok(_) => {}
-			Err(_) => capacity_overflow(),
-		}
-		let result = self.alloc.allocate(layout);
-		let dst = match result {
-			Ok(ptr) => ptr,
-			Err(_) => handle_alloc_error(layout),
-		};
-
-		let src = self.as_slice();
-		src.as_ptr().copy_to_nonoverlapping(dst.as_ptr().cast(), N);
-
-		self.set_ptr(dst);
-
-		Ok(())
-	}
-
-	/// Grow the memory allocated on the heap.
-	/// 
-	/// ## Safety
-	/// 
-	/// The caller must ensure that the data is owned and stored on the heap (spilled).
-	unsafe fn grow_amortized(&mut self, additional: usize) -> Result<(), TryReserveError> {
-		// This is ensured by the calling contexts.
-		debug_assert!(additional > 0);
-		debug_assert!(self.is_spilled());
-
-		if mem::size_of::<T>() == 0 {
-			// Since we return a capacity of `usize::MAX` when `elem_size` is
-			// 0, getting to here necessarily means the `RawVec` is overfull.
-			return Err(TryReserveError::CapacityOverflow);
-		}
-
-		let len = self.len();
-
-		// Nothing we can really do about these checks, sadly.
-		let required_cap = len.checked_add(additional).ok_or(TryReserveError::CapacityOverflow)?;
-
-		match self.capacity() {
-			Some(capacity) => {
-				// This guarantees exponential growth. The doubling cannot overflow
-				// because `cap <= isize::MAX` and the type of `cap` is `usize`.
-				let cap = cmp::max(capacity * 2, required_cap);
-
-				// Tiny Vecs are dumb. Skip to:
-				// - 8 if the element size is 1, because any heap allocators is likely
-				//   to round up a request of less than 8 bytes to at least 8 bytes.
-				// - 4 if elements are moderate-sized (<= 1 KiB).
-				// - 1 otherwise, to avoid wasting too much space for very short Vecs.
-				// Note that `min_non_zero_cap` is computed statically.
-				let elem_size = mem::size_of::<T>();
-				let min_non_zero_cap = if elem_size == 1 {
-					8
-				} else if elem_size <= 1024 {
-					4
-				} else {
-					1
-				};
-				let cap = cmp::max(min_non_zero_cap, cap);
-
-				let new_layout = Layout::array::<T>(cap);
-
-				// `finish_grow` is non-generic over `T`.
-				let ptr = finish_grow(new_layout, self.current_memory(), &mut self.alloc)?;
-				self.set_ptr(ptr);
-				Ok(())
-			},
-			None => {
-				panic!("cannot grow a borrowed slice")
-			}
-		}
-	}
-
-	// The constraints on this method are much the same as those on
-	// `grow_amortized`, but this method is usually instantiated less often so
-	// it's less critical.
-	unsafe fn grow_exact(&mut self, additional: usize) -> Result<(), TryReserveError> {
-		debug_assert!(self.is_spilled());
-
-		if mem::size_of::<T>() == 0 {
-			// Since we return a capacity of `usize::MAX` when the type size is
-			// 0, getting to here necessarily means the `RawVec` is overfull.
-			return Err(TryReserveError::CapacityOverflow);
-		}
-
-		let len = self.len();
-		let cap = len.checked_add(additional).ok_or(TryReserveError::CapacityOverflow)?;
-		let new_layout = Layout::array::<T>(cap);
-
-		// `finish_grow` is non-generic over `T`.
-		let ptr = finish_grow(new_layout, self.current_memory(), &mut self.alloc)?;
-		self.set_ptr(ptr);
-		Ok(())
-	}
-
-	unsafe fn shrink(&mut self, amount: usize) -> Result<(), TryReserveError> {
-		match self.capacity() {
-			Some(capacity) => {
-				assert!(amount <= capacity, "Tried to shrink to a larger capacity");
-
-				let (ptr, layout) = if let Some(mem) = self.current_memory() {
-					mem
-				} else {
-					return Ok(())
-				};
-
-				let new_size = amount * mem::size_of::<T>();
-
-				let ptr = {
-					let new_layout = Layout::from_size_align_unchecked(new_size, layout.align());
-					self.alloc.shrink(ptr, layout, new_layout).map_err(|_| TryReserveError::AllocError {
-						layout: new_layout,
-						non_exhaustive: (),
-					})?
-				};
-
-				self.set_ptr(ptr);
-				Ok(())
-			},
-			None => {
-				panic!("Tried to shrink borrowed data")
-			}
-		}
-	}
-
 	/// Extend the vector by `n` values, using the given generator.
 	fn extend_with<E: ExtendWith<T>>(&mut self, n: usize, mut value: E) {
 		self.reserve(n);
@@ -1230,7 +770,7 @@ impl<'a, M: Meta, T, A: Allocator, const N: usize> CalfVec<'a, M, T, A, N> where
 			// Use SetLenOnDrop to work around bug where compiler
 			// may not realize the store through `ptr` through self.set_len()
 			// don't alias.
-			let mut local_len = SetLenOnDrop::new(&mut self.meta);
+			let mut local_len = SetLenOnDrop::new(self.raw.meta_mut());
 
 			// Write all elements except the last one
 			for _ in 1..n {
@@ -1314,31 +854,6 @@ impl<T, F: FnMut() -> T> ExtendWith<T> for ExtendFunc<F> {
 	fn last(mut self) -> T {
 		(self.0)()
 	}
-}
-
-// This function is outside `CalfVec` to minimize compile times. See the comment
-// above `RawVec::grow_amortized` for details. (The `A` parameter isn't
-// significant, because the number of different `A` types seen in practice is
-// much smaller than the number of `T` types.)
-#[inline(never)]
-fn finish_grow<A>(new_layout: Result<Layout, LayoutError>, current_memory: Option<(NonNull<u8>, Layout)>, alloc: &mut A) -> Result<NonNull<[u8]>, TryReserveError> where A: Allocator {
-	// Check for the error here to minimize the size of `CalfVec::grow_*`.
-	let new_layout = new_layout.map_err(|_| TryReserveError::CapacityOverflow)?;
-
-	alloc_guard(new_layout.size())?;
-
-	let memory = if let Some((ptr, old_layout)) = current_memory {
-		debug_assert_eq!(old_layout.align(), new_layout.align());
-		unsafe {
-			// The allocator checks for alignment equality
-			// intrinsics::assume(old_layout.align() == new_layout.align()); // TODO is thre a way to keep this optimisation outside of the compiler?
-			alloc.grow(ptr, old_layout, new_layout)
-		}
-	} else {
-		alloc.allocate(new_layout)
-	};
-
-	memory.map_err(|_| TryReserveError::AllocError { layout: new_layout, non_exhaustive: () })
 }
 
 impl<'a, M: Meta, T: Clone, A: Allocator + Clone, const N: usize> Clone for CalfVec<'a, M, T, A, N> {
@@ -1450,12 +965,7 @@ impl<'a, M: Meta, T, A: Allocator, const N: usize> IntoIterator for CalfVec<'a, 
 	fn into_iter(mut self) -> Self::IntoIter {
 		unsafe {
 			let capacity = self.own();
-
-			let alloc = ptr::read(&self.alloc); // this is safe because `self.alloc` is not used ever after.
-			let meta = self.meta;
-			let mut data = Data::dangling();
-			std::mem::swap(&mut data, &mut self.data);
-			std::mem::forget(self); // there is nothing left to drop in `self`, we can forget it.
+			let (meta, data, alloc) = self.into_raw_parts_with_alloc();
 
 			let into_iter_data = if capacity <= N {
 				IntoIterData {
@@ -1599,23 +1109,6 @@ fn handle_reserve(result: Result<(), TryReserveError>) {
 		Err(TryReserveError::CapacityOverflow) => capacity_overflow(),
 		Err(TryReserveError::AllocError { layout, .. }) => handle_alloc_error(layout),
 		Ok(()) => { /* yay */ }
-	}
-}
-
-// We need to guarantee the following:
-// * We don't ever allocate `> isize::MAX` byte-size objects.
-// * We don't overflow `usize::MAX` and actually allocate too little.
-//
-// On 64-bit we just need to check for overflow since trying to allocate
-// `> isize::MAX` bytes will surely fail. On 32-bit and 16-bit we need to add
-// an extra guard for this in case we're running on a platform which can use
-// all 4GB in user-space, e.g., PAE or x32.
-#[inline]
-fn alloc_guard(alloc_size: usize) -> Result<(), TryReserveError> {
-	if usize::BITS < 64 && alloc_size > isize::MAX as usize {
-		Err(TryReserveError::CapacityOverflow)
-	} else {
-		Ok(())
 	}
 }
 
