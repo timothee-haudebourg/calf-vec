@@ -1,4 +1,8 @@
 use std::{
+	alloc::{
+		AllocRef,
+		Global
+	},
 	str,
 	ptr,
 	fmt,
@@ -32,12 +36,13 @@ use crate::generic::{
 /// [`std::str`]: core::str
 /// [`&str`]: prim@str
 /// [`utf8_error`]: Self::utf8_error
-pub struct FromUtf8Error<'a, M: Meta, const N: usize> {
-	bytes: CalfVec<'a, M, u8, N>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FromUtf8Error<'a, M: Meta, A: AllocRef, const N: usize> {
+	bytes: CalfVec<'a, M, u8, A, N>,
 	error: str::Utf8Error
 }
 
-impl<'a, M: Meta, const N: usize> FromUtf8Error<'a, M, N> {
+impl<'a, M: Meta, A: AllocRef, const N: usize> FromUtf8Error<'a, M, A, N> {
 	/// Returns a slice of [`u8`]s bytes that were attempted to convert to a `CalfString`.
 	pub fn as_bytes(&self) -> &[u8] {
 		&self.bytes
@@ -48,7 +53,7 @@ impl<'a, M: Meta, const N: usize> FromUtf8Error<'a, M, N> {
 	/// This method is carefully constructed to avoid allocation. It will
 	/// consume the error, moving out the bytes, so that a copy of the bytes
 	/// does not need to be made.
-	pub fn into_bytes(self) -> CalfVec<'a, M, u8, N> {
+	pub fn into_bytes(self) -> CalfVec<'a, M, u8, A, N> {
 		self.bytes
 	}
 
@@ -69,22 +74,22 @@ impl<'a, M: Meta, const N: usize> FromUtf8Error<'a, M, N> {
 
 type FromUtf16Error = std::string::FromUtf16Error;
 
-pub struct CalfString<'a, M: Meta, const N: usize> {
+pub struct CalfString<'a, M: Meta, A: AllocRef, const N: usize> {
 	/// Internal bytes buffer.
-	vec: CalfVec<'a, M, u8, N>
+	vec: CalfVec<'a, M, u8, A, N>
 }
 
-impl<'a, M: Meta, const N: usize> CalfString<'a, M, N> {
+impl<'a, M: Meta, const N: usize> CalfString<'a, M, Global, N> {
 	/// Creates a new empty `String`.
 	// TODO make this function `const` as soon as the `const_fn` feature allows it.
 	#[inline]
-	pub fn new() -> CalfString<'a, M, N> {
+	pub fn new() -> CalfString<'a, M, Global, N> {
 		CalfString { vec: CalfVec::new() }
 	}
 
 	/// Creates a new empty `CalfString` with a particular capacity.
 	#[inline]
-	pub fn with_capacity(capacity: usize) -> CalfString<'a, M, N> {
+	pub fn with_capacity(capacity: usize) -> CalfString<'a, M, Global, N> {
 		CalfString { vec: CalfVec::with_capacity(capacity) }
 	}
 
@@ -101,7 +106,7 @@ impl<'a, M: Meta, const N: usize> CalfString<'a, M, N> {
 	/// to it are valid UTF-8. If this constraint is violated, it may cause
 	/// memory unsafety issues with future users of the `CalfString`.
 	#[inline]
-	pub unsafe fn from_utf8_unchecked<B: Into<CalfVec<'a, M, u8, N>>>(bytes: B) -> CalfString<'a, M, N> {
+	pub unsafe fn from_utf8_unchecked<B: Into<CalfVec<'a, M, u8, Global, N>>>(bytes: B) -> CalfString<'a, M, Global, N> {
 		CalfString { vec: bytes.into() }
 	}
 
@@ -131,7 +136,7 @@ impl<'a, M: Meta, const N: usize> CalfString<'a, M, N> {
 	/// Returns [`Err`] if the slice is not UTF-8 with a description as to why the
 	/// provided bytes are not UTF-8. The vector you moved in is also included.
 	#[inline]
-	pub fn from_utf8<B: Into<CalfVec<'a, M, u8, N>>>(bytes: B) -> Result<CalfString<'a, M, N>, FromUtf8Error<'a, M, N>> {
+	pub fn from_utf8<B: Into<CalfVec<'a, M, u8, Global, N>>>(bytes: B) -> Result<CalfString<'a, M, Global, N>, FromUtf8Error<'a, M, Global, N>> {
 		let vec = bytes.into();
 		match str::from_utf8(&vec) {
 			Ok(..) => Ok(CalfString { vec }),
@@ -158,14 +163,14 @@ impl<'a, M: Meta, const N: usize> CalfString<'a, M, N> {
 	///
 	/// [`from_utf8_unchecked`]: CalfString::from_utf8_unchecked
 	#[inline]
-	pub fn from_utf8_lossy(v: &'a [u8]) -> CalfString<'a, M, N> {
+	pub fn from_utf8_lossy(v: &'a [u8]) -> CalfString<'a, M, Global, N> {
 		String::from_utf8_lossy(v).into()
 	}
 
 	/// Decode a UTF-16 encoded vector `v` into a `CalfString`, returning [`Err`]
 	/// if `v` contains any invalid data.
 	#[inline]
-	pub fn from_utf16(v: &[u16]) -> Result<CalfString<'a, M, N>, FromUtf16Error> {
+	pub fn from_utf16(v: &[u16]) -> Result<CalfString<'a, M, Global, N>, FromUtf16Error> {
 		let str = String::from_utf16(v)?;
 		Ok(str.into())
 	}
@@ -176,10 +181,12 @@ impl<'a, M: Meta, const N: usize> CalfString<'a, M, N> {
 	/// [`from_utf8_lossy`]: CalfString::from_utf8_lossy
 	/// [U+FFFD]: core::char::REPLACEMENT_CHARACTER
 	#[inline]
-	pub fn from_utf16_lossy(v: &[u16]) -> CalfString<'a, M, N> {
+	pub fn from_utf16_lossy(v: &[u16]) -> CalfString<'a, M, Global, N> {
 		String::from_utf16_lossy(v).into()
 	}
+}
 
+impl<'a, M: Meta, A: AllocRef, const N: usize> CalfString<'a, M, A, N> {
 	/// Returns this `String`'s size, in bytes.
 	#[inline]
 	pub fn len(&self) -> usize {
@@ -196,7 +203,7 @@ impl<'a, M: Meta, const N: usize> CalfString<'a, M, N> {
 	///
 	/// This consumes the `CalfString`, so we do not need to copy its contents.
 	#[inline]
-	pub fn into_bytes(self) -> CalfVec<'a, M, u8, N> {
+	pub fn into_bytes(self) -> CalfVec<'a, M, u8, A, N> {
 		self.vec
 	}
 
@@ -246,7 +253,8 @@ impl<'a, M: Meta, const N: usize> CalfString<'a, M, N> {
 
 	/// Shrinks the capacity of this `CalfString` to match its length.
 	#[inline]
-	pub fn shrink_to_fit(&mut self) {
+	pub fn shrink_to_fit(&mut self) where A: Clone {
+		// TODO remove the `Clone` bound in `A` by not using `Vec::from_raw_parts_in` in `CalfVec::shrink_to`.
 		self.vec.shrink_to_fit()
 	}
 
@@ -258,7 +266,8 @@ impl<'a, M: Meta, const N: usize> CalfString<'a, M, N> {
 	/// Panics if the current capacity is smaller than the supplied
 	/// minimum capacity.
 	#[inline]
-	pub fn shrink_to(&mut self, min_capacity: usize) {
+	pub fn shrink_to(&mut self, min_capacity: usize) where A: Clone {
+		// TODO remove the `Clone` bound in `A` by not using `Vec::from_raw_parts_in` in `CalfVec::shrink_to`.
 		self.vec.shrink_to(min_capacity)
 	}
 
@@ -461,7 +470,7 @@ impl<'a, M: Meta, const N: usize> CalfString<'a, M, N> {
 	/// memory unsafety issues with future users of the `CalfString`, as the rest of
 	/// the standard library assumes that `CalfString`s are valid UTF-8.
 	#[inline]
-	pub unsafe fn as_mut_vec(&mut self) -> &mut CalfVec<'a, M, u8, N> {
+	pub unsafe fn as_mut_vec(&mut self) -> &mut CalfVec<'a, M, u8, A, N> {
 		&mut self.vec
 	}
 
@@ -485,7 +494,7 @@ impl<'a, M: Meta, const N: usize> CalfString<'a, M, N> {
 	}
 }
 
-impl<'a, M: Meta, const N: usize> Deref for CalfString<'a, M, N> {
+impl<'a, M: Meta, A: AllocRef, const N: usize> Deref for CalfString<'a, M, A, N> {
 	type Target = str;
 
 	#[inline]
@@ -496,7 +505,7 @@ impl<'a, M: Meta, const N: usize> Deref for CalfString<'a, M, N> {
 	}
 }
 
-impl<'a, M: Meta, const N: usize> DerefMut for CalfString<'a, M, N> {
+impl<'a, M: Meta, A: AllocRef, const N: usize> DerefMut for CalfString<'a, M, A, N> {
 	#[inline]
 	fn deref_mut(&mut self) -> &mut str {
 		unsafe {
@@ -505,27 +514,27 @@ impl<'a, M: Meta, const N: usize> DerefMut for CalfString<'a, M, N> {
 	}
 }
 
-impl<'a, M: Meta, const N: usize> From<&'a str> for CalfString<'a, M, N> {
+impl<'a, M: Meta, const N: usize> From<&'a str> for CalfString<'a, M, Global, N> {
 	#[inline]
-	fn from(s: &'a str) -> CalfString<'a, M, N> {
+	fn from(s: &'a str) -> CalfString<'a, M, Global, N> {
 		CalfString {
 			vec: s.as_bytes().into()
 		}
 	}
 }
 
-impl<'a, M: Meta, const N: usize> From<String> for CalfString<'a, M, N> {
+impl<'a, M: Meta, const N: usize> From<String> for CalfString<'a, M, Global, N> {
 	#[inline]
-	fn from(s: String) -> CalfString<'a, M, N> {
+	fn from(s: String) -> CalfString<'a, M, Global, N> {
 		CalfString {
 			vec: s.into_bytes().into()
 		}
 	}
 }
 
-impl<'a, M: Meta, const N: usize> From<Cow<'a, str>> for CalfString<'a, M, N> {
+impl<'a, M: Meta, const N: usize> From<Cow<'a, str>> for CalfString<'a, M, Global, N> {
 	#[inline]
-	fn from(c: Cow<'a, str>) -> CalfString<'a, M, N> {
+	fn from(c: Cow<'a, str>) -> CalfString<'a, M, Global, N> {
 		match c {
 			Cow::Borrowed(s) => s.into(),
 			Cow::Owned(s) => s.into()
@@ -533,14 +542,43 @@ impl<'a, M: Meta, const N: usize> From<Cow<'a, str>> for CalfString<'a, M, N> {
 	}
 }
 
-impl<'a, M: Meta, const N: usize> fmt::Display for CalfString<'a, M, N> {
+impl<'a, M: Meta, const N: usize> std::str::FromStr for CalfString<'a, M, Global, N> {
+	type Err = std::convert::Infallible;
+
+	fn from_str(s: &str) -> Result<CalfString<'a, M, Global, N>, std::convert::Infallible> {
+		Ok(String::from_str(s).unwrap().into())
+	}
+}
+
+impl<'a, M: Meta, A: AllocRef, const N: usize> PartialEq<str> for CalfString<'a, M, A, N> {
+	#[inline]
+	fn eq(&self, other: &str) -> bool {
+		self.as_str() == other
+	}
+}
+
+impl<'a, 'b, M: Meta, A: AllocRef, const N: usize> PartialEq<&'b str> for CalfString<'a, M, A, N> {
+	#[inline]
+	fn eq(&self, other: &&'b str) -> bool {
+		self.as_str() == *other
+	}
+}
+
+impl<'a, M: Meta, A: AllocRef, const N: usize> PartialEq<String> for CalfString<'a, M, A, N> {
+	#[inline]
+	fn eq(&self, other: &String) -> bool {
+		self.as_str() == other
+	}
+}
+
+impl<'a, M: Meta, A: AllocRef, const N: usize> fmt::Display for CalfString<'a, M, A, N> {
 	#[inline]
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		fmt::Display::fmt(&**self, f)
 	}
 }
 
-impl<'a, M: Meta, const N: usize> fmt::Debug for CalfString<'a, M, N> {
+impl<'a, M: Meta, A: AllocRef, const N: usize> fmt::Debug for CalfString<'a, M, A, N> {
 	#[inline]
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		fmt::Debug::fmt(&**self, f)

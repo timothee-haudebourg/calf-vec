@@ -1,4 +1,8 @@
 use std::{
+	alloc::{
+		AllocRef,
+		Global
+	},
 	marker::PhantomData,
 	mem::ManuallyDrop,
 	ptr,
@@ -49,7 +53,7 @@ union Data<T, const N: usize> {
 	/// Data stored on the stack.
 	stack: ManuallyDrop<[T; N]>,
 
-	/// Pointer to the data (aither borrowed, or owned on the heap).
+	/// Pointer to the data (either borrowed, or owned on the heap).
 	ptr: *mut T
 }
 
@@ -62,7 +66,7 @@ impl<T, const N: usize> Data<T, N> {
 	}
 
 	#[inline]
-	unsafe fn drop_with<M: Meta>(&mut self, meta: M) {
+	unsafe fn drop_with<M: Meta, A: AllocRef>(&mut self, meta: M, alloc: &A) {
 		match meta.capacity() {
 			Some(capacity) => {
 				let len = meta.len();
@@ -71,7 +75,7 @@ impl<T, const N: usize> Data<T, N> {
 					ptr::drop_in_place(&mut (*self.stack)[0..len]);
 				} else {
 					// spilled
-					Vec::from_raw_parts(self.ptr, len, capacity);
+					Vec::from_raw_parts_in(self.ptr, len, capacity, alloc);
 				}
 			},
 			None => ()
@@ -110,33 +114,39 @@ impl<T, const N: usize> Data<T, N> {
 /// # use calf_vec::CalfVec;
 /// let owned: CalfVec<'_, u8, 32> = CalfVec::owned(vec![1, 2, 3]);
 /// ```
-pub struct CalfVec<'a, M: Meta, T, const N: usize> {
+pub struct CalfVec<'a, M: Meta, T, A: AllocRef, const N: usize> {
 	/// Metadata storing the length and capacity of the array.
 	meta: M,
 
 	/// The actual data (or a pointer to the actual data).
 	data: Data<T, N>,
 
+	/// Allocator.
+	alloc: A,
+
 	/// Remembers the lifetime of the data if it is borrowed.
 	lifetime: PhantomData<&'a T>
 }
 
-impl<'a, M: Meta, T, const N: usize> Drop for CalfVec<'a, M, T, N> {
+impl<'a, M: Meta, T, A: AllocRef, const N: usize> Drop for CalfVec<'a, M, T, A, N> {
 	fn drop(&mut self) {
 		unsafe {
-			self.data.drop_with(self.meta)
+			self.data.drop_with(self.meta, &self.alloc)
 		}
 	}
 }
 
-impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> {
+impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, Global, N> {
 	/// Creates a new empty `CalfVec`.
+	/// 
+	/// The vector will not allocate until more than `N` elements are pushed onto it.
 	// TODO make this function `const` as soon as the `const_fn` feature allows it.
 	#[inline]
-	pub fn new() -> CalfVec<'a, M, T, N> {
+	pub fn new() -> CalfVec<'a, M, T, Global, N> {
 		CalfVec {
 			meta: M::new(0, Some(N)),
 			data: Data::new(),
+			alloc: Global,
 			lifetime: PhantomData
 		}
 	}
@@ -145,7 +155,7 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> {
 	///
 	/// The actual capacity of the created `CalfVec` will be at least `N`.
 	#[inline]
-	pub fn with_capacity(capacity: usize) -> CalfVec<'a, M, T, N> {
+	pub fn with_capacity(capacity: usize) -> CalfVec<'a, M, T, Global, N> {
 		if capacity <= N {
 			CalfVec::new()
 		} else {
@@ -155,6 +165,7 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> {
 			CalfVec {
 				meta: M::new(0, Some(actual_capacity)),
 				data: Data { ptr },
+				alloc: Global,
 				lifetime: PhantomData
 			}
 		}
@@ -174,12 +185,39 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> {
 	/// assert_eq!(calf, [4, 2, 3])
 	/// ```
 	#[inline]
-	pub fn borrowed<B: AsRef<[T]> + ?Sized>(borrowed: &'a B) -> CalfVec<'a, M, T, N> {
+	pub fn borrowed<B: AsRef<[T]> + ?Sized>(borrowed: &'a B) -> CalfVec<'a, M, T, Global, N> {
 		let slice = borrowed.as_ref();
 
 		CalfVec {
 			meta: M::new(slice.len(), None),
 			data: Data { ptr: slice.as_ptr() as *mut T },
+			alloc: Global,
+			lifetime: PhantomData
+		}
+	}
+}
+
+impl<'a, M: Meta, T, A: AllocRef, const N: usize> CalfVec<'a, M, T, A, N> {
+	/// Constructs a new, empty `CalfVec<M, T, A, N>`.
+	///
+	/// The vector will not allocate until more than `N` elements are pushed onto it.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// #![feature(allocator_api)]
+	///
+	/// use std::alloc::System;
+	///
+	/// # #[allow(unused_mut)]
+	/// let mut vec: Vec<i32, _> = Vec::new_in(System);
+	/// ```
+	#[inline]
+	pub fn new_in(alloc: A) -> CalfVec<'a, M, T, A, N> {
+		CalfVec {
+			meta: M::new(0, Some(N)),
+			data: Data::new(),
+			alloc,
 			lifetime: PhantomData
 		}
 	}
@@ -189,8 +227,9 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> {
 	/// The input is consumed and stored either on the stack if it does not exceed the
 	/// capacity parameter `N`, or on the heap otherwise.
 	#[inline]
-	pub fn owned<O: Into<Vec<T>>>(owned: O) -> CalfVec<'a, M, T, N> {
+	pub fn owned<O: Into<Vec<T, A>>>(owned: O) -> CalfVec<'a, M, T, A, N> where A: Clone {
 		let vec = owned.into();
+		let alloc = vec.alloc_ref().clone();
 		let (ptr, len, capacity) = vec.into_raw_parts();
 		if capacity <= N {
 			// put on stack
@@ -202,6 +241,7 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> {
 				CalfVec {
 					meta: M::new(len, Some(N)),
 					data,
+					alloc,
 					lifetime: PhantomData
 				}
 			}
@@ -210,9 +250,16 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> {
 			CalfVec {
 				meta: M::new(len, Some(capacity)),
 				data: Data { ptr },
+				alloc,
 				lifetime: PhantomData
 			}
 		}
+	}
+
+	/// Returns a reference to the underlying allocator.
+	#[inline]
+	pub fn alloc_ref(&self) -> &A {
+		&self.alloc
 	}
 
 	/// Try to convert this `CalfVec` into a borrowed slice.
@@ -258,13 +305,14 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> {
 	///
 	/// This is a cost-free operation.
 	#[inline]
-	pub fn try_into_vec(self) -> Result<Vec<T>, Self> {
+	pub fn try_into_vec(self) -> Result<Vec<T, A>, Self> {
 		match self.capacity() {
 			Some(capacity) if capacity > N => unsafe {
+				let alloc = ptr::read(&self.alloc); // this is safe because `self.alloc` is never used ever after.
 				let ptr = self.data.ptr;
 				let len = self.len();
 				std::mem::forget(self); // there is nothing left to drop in `self`, we can forget it.
-				Ok(Vec::from_raw_parts(ptr, len, capacity))
+				Ok(Vec::from_raw_parts_in(ptr, len, capacity, alloc))
 			},
 			_ => Err(self)
 		}
@@ -276,18 +324,19 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> {
 	/// If the data is owned on the stack, it will be moved on the heap.
 	/// If the data is owned on the heap, then this is a cost-free operation.
 	#[inline]
-	pub fn into_vec(mut self) -> Vec<T> where T: Clone {
+	pub fn into_vec(mut self) -> Vec<T, A> where T: Clone {
 		unsafe {
 			let capacity = self.own();
 			let len = self.len();
+			let alloc = ptr::read(&self.alloc); // this is safe because `self.alloc` is never used ever after.
 			let vec = if capacity <= N {
 				let src = (*self.data.stack).as_mut_ptr();
-				let mut vec = Vec::with_capacity(len);
+				let mut vec = Vec::with_capacity_in(len, alloc);
 				std::ptr::copy_nonoverlapping(src, vec.as_mut_ptr(), len);
 				vec
 			} else {
 				let ptr = self.data.ptr;
-				Vec::from_raw_parts(ptr, len, capacity)
+				Vec::from_raw_parts_in(ptr, len, capacity, alloc)
 			};
 			std::mem::forget(self); // there is nothing left to drop in `self`, we can forget it.
 			vec
@@ -355,7 +404,7 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> {
 	}
 }
 
-impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> where T: Clone {
+impl<'a, M: Meta, T, A: AllocRef, const N: usize> CalfVec<'a, M, T, A, N> where T: Clone {
 	#[inline]
 	pub fn own(&mut self) -> usize {
 		match self.capacity() {
@@ -366,11 +415,11 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> where T: Clone {
 
 				let capacity = if len <= N {
 					// clone on stack
-					&mut (*self.data.stack)[0..len].clone_from_slice(slice);
+					&mut (*self.data.stack)[0..len].clone_from_slice(slice); // FIXME
 					N
 				} else {
 					// clone on heap
-					let (ptr, _, capacity) = self.as_slice().to_vec().into_raw_parts();
+					let (ptr, _, capacity) = self.as_slice().to_vec_in(self.alloc).into_raw_parts();
 					self.data.ptr = ptr;
 					capacity
 				};
@@ -456,7 +505,7 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> where T: Clone {
 			let mut vec = if capacity <= N {
 				self.spill()
 			} else {
-				Vec::from_raw_parts(self.data.ptr, self.len(), capacity)
+				Vec::from_raw_parts_in(self.data.ptr, self.len(), capacity, self.alloc)
 			};
 
 			vec.reserve(additional);
@@ -484,7 +533,7 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> where T: Clone {
 			let mut vec = if capacity <= N {
 				self.spill()
 			} else {
-				Vec::from_raw_parts(self.data.ptr, self.len(), capacity)
+				Vec::from_raw_parts_in(self.data.ptr, self.len(), capacity, self.alloc)
 			};
 
 			vec.reserve_exact(additional);
@@ -497,15 +546,18 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> where T: Clone {
 	/// Move the data on the stack.
 	///
 	/// The data must already be owned, and on the stack.
+	/// 
+	/// Returns a `Vec` holding the data.
+	/// The returned `Vec` **must not be dropped**.
 	#[inline]
-	unsafe fn spill(&mut self) -> Vec<T> {
+	unsafe fn spill(&mut self) -> Vec<T, A> {
 		let mut data = Data {
 			ptr: ptr::null_mut()
 		};
 
 		std::mem::swap(&mut data, &mut self.data);
 
-		let boxed_slice: Box<[T]> = Box::new(ManuallyDrop::into_inner(data.stack));
+		let boxed_slice: Box<[T], A> = Box::new_in(ManuallyDrop::into_inner(data.stack), self.alloc);
 		let mut vec = boxed_slice.into_vec();
 
 		self.data.ptr = vec.as_mut_ptr();
@@ -527,7 +579,8 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> where T: Clone {
 	///
 	/// Panics if the current capacity is smaller than the supplied
 	/// minimum capacity.
-	pub fn shrink_to(&mut self, min_capacity: usize) {
+	pub fn shrink_to(&mut self, min_capacity: usize) where A: Clone {
+		// FIXME remove the `Clone` bound in `A` by not using `Vec::from_raw_parts_in`.
 		match self.capacity() {
 			Some(capacity) => unsafe {
 				assert!(capacity < min_capacity);
@@ -540,11 +593,11 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> where T: Clone {
 							// put back on the stack.
 							let ptr = self.data.ptr;
 							ptr::copy_nonoverlapping(ptr, (*self.data.stack).as_mut_ptr(), len);
-							Vec::from_raw_parts(ptr, 0, capacity); // drop the vec without touching its content.
+							Vec::from_raw_parts_in(ptr, 0, capacity, self.alloc.clone()); // drop the vec without touching its content.
 							self.meta.set_capacity(Some(N));
 						}
 					} else {
-						let mut vec = Vec::from_raw_parts(self.data.ptr, len, capacity);
+						let mut vec = Vec::from_raw_parts_in(self.data.ptr, len, capacity, self.alloc.clone());
 						vec.shrink_to(new_capacity);
 						let (ptr, _, actual_new_capacity) = vec.into_raw_parts();
 						self.data.ptr = ptr;
@@ -561,7 +614,8 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> where T: Clone {
 	/// It will drop down as close as possible to the length but the allocator
 	/// may still inform the vector that there is space for a few more elements.
 	#[inline]
-	pub fn shrink_to_fit(&mut self) {
+	pub fn shrink_to_fit(&mut self) where A: Clone {
+		// FIXME remove the `Clone` bound in `A` by not using `Vec::from_raw_parts_in` in `shrink_to`.
 		self.shrink_to(self.len());
 	}
 
@@ -749,10 +803,28 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, N> where T: Clone {
 	}
 }
 
-unsafe impl<'a, M: Meta + Send, T: Sync, const N: usize> Send for CalfVec<'a, M, T, N> {}
-unsafe impl<'a, M: Meta + Sync, T: Sync, const N: usize> Sync for CalfVec<'a, M, T, N> {}
+impl<'a, M: Meta, T: Clone, A: AllocRef + Clone, const N: usize> Clone for CalfVec<'a, M, T, A, N> {
+	fn clone(&self) -> CalfVec<'a, M, T, A, N> {
+		CalfVec::owned(self)
+	}
+}
 
-impl<'a, M: Meta, T, const N: usize> Deref for CalfVec<'a, M, T, N> {
+impl<'v, 'a, M: Meta, T: Clone, A: AllocRef + Clone, const N: usize> From<&'v CalfVec<'a, M, T, A, N>> for Vec<T, A> {
+	fn from(vec: &'v CalfVec<'a, M, T, A, N>) -> Vec<T, A> {
+		vec.to_vec_in(vec.alloc_ref().clone())
+	}
+}
+
+impl<'a, M: Meta, T: Clone, A: AllocRef, const N: usize> From<CalfVec<'a, M, T, A, N>> for Vec<T, A> {
+	fn from(vec: CalfVec<'a, M, T, A, N>) -> Vec<T, A> {
+		vec.into_vec()
+	}
+}
+
+unsafe impl<'a, M: Meta + Send, T: Sync, A: AllocRef + Send, const N: usize> Send for CalfVec<'a, M, T, A, N> {}
+unsafe impl<'a, M: Meta + Sync, T: Sync, A: AllocRef, const N: usize> Sync for CalfVec<'a, M, T, A, N> {}
+
+impl<'a, M: Meta, T, A: AllocRef, const N: usize> Deref for CalfVec<'a, M, T, A, N> {
 	type Target = [T];
 
 	#[inline]
@@ -761,14 +833,14 @@ impl<'a, M: Meta, T, const N: usize> Deref for CalfVec<'a, M, T, N> {
 	}
 }
 
-impl<'a, M: Meta, T, const N: usize> DerefMut for CalfVec<'a, M, T, N> where T: Clone {
+impl<'a, M: Meta, T, A: AllocRef, const N: usize> DerefMut for CalfVec<'a, M, T, A, N> where T: Clone {
 	#[inline]
 	fn deref_mut(&mut self) -> &mut [T] {
 		self.as_mut_slice()
 	}
 }
 
-impl<'v, 'a, M: Meta, T, const N: usize> IntoIterator for &'v CalfVec<'a, M, T, N> {
+impl<'v, 'a, M: Meta, T, A: AllocRef, const N: usize> IntoIterator for &'v CalfVec<'a, M, T, A, N> {
 	type Item = &'v T;
 	type IntoIter = std::slice::Iter<'v, T>;
 
@@ -777,7 +849,7 @@ impl<'v, 'a, M: Meta, T, const N: usize> IntoIterator for &'v CalfVec<'a, M, T, 
 	}
 }
 
-impl<'v, 'a, M: Meta, T, const N: usize> IntoIterator for &'v mut CalfVec<'a, M, T, N> where T: Clone {
+impl<'v, 'a, M: Meta, T, A: AllocRef, const N: usize> IntoIterator for &'v mut CalfVec<'a, M, T, A, N> where T: Clone {
 	type Item = &'v mut T;
 	type IntoIter = std::slice::IterMut<'v, T>;
 
@@ -786,18 +858,18 @@ impl<'v, 'a, M: Meta, T, const N: usize> IntoIterator for &'v mut CalfVec<'a, M,
 	}
 }
 
-pub union IntoIterData<T, const N: usize> {
+pub union IntoIterData<T, A: AllocRef, const N: usize> {
 	stack: ManuallyDrop<[T; N]>,
-	vec: ManuallyDrop<std::vec::IntoIter<T>>
+	vec: ManuallyDrop<std::vec::IntoIter<T, A>>
 }
 
-pub struct IntoIter<M: Meta, T, const N: usize> {
+pub struct IntoIter<M: Meta, T, A: AllocRef, const N: usize> {
 	meta: M,
 	offset: usize,
-	data: IntoIterData<T, N>
+	data: IntoIterData<T, A, N>
 }
 
-impl<M: Meta, T, const N: usize> Iterator for IntoIter<M, T, N> {
+impl<M: Meta, T, A: AllocRef, const N: usize> Iterator for IntoIter<M, T, A, N> {
 	type Item = T;
 
 	fn next(&mut self) -> Option<T> {
@@ -820,7 +892,7 @@ impl<M: Meta, T, const N: usize> Iterator for IntoIter<M, T, N> {
 	}
 }
 
-impl<M: Meta, T, const N: usize> Drop for IntoIter<M, T, N> {
+impl<M: Meta, T, A: AllocRef, const N: usize> Drop for IntoIter<M, T, A, N> {
 	fn drop(&mut self) {
 		unsafe {
 			let capacity = self.meta.capacity().unwrap();
@@ -833,14 +905,15 @@ impl<M: Meta, T, const N: usize> Drop for IntoIter<M, T, N> {
 	}
 }
 
-impl<'a, M: Meta, T, const N: usize> IntoIterator for CalfVec<'a, M, T, N> where T: Clone {
+impl<'a, M: Meta, T, A: AllocRef, const N: usize> IntoIterator for CalfVec<'a, M, T, A, N> where T: Clone {
 	type Item = T;
-	type IntoIter = IntoIter<M, T, N>;
+	type IntoIter = IntoIter<M, T, A, N>;
 
 	fn into_iter(mut self) -> Self::IntoIter {
 		unsafe {
 			let capacity = self.own();
 
+			let alloc = ptr::read(&self.alloc); // this is safe because `self.alloc` is not used ever after.
 			let meta = self.meta;
 			let mut data = Data {
 				ptr: ptr::null_mut()
@@ -853,7 +926,7 @@ impl<'a, M: Meta, T, const N: usize> IntoIterator for CalfVec<'a, M, T, N> where
 					stack: data.stack
 				}
 			} else {
-				let vec = Vec::from_raw_parts(data.ptr, meta.len(), capacity);
+				let vec = Vec::from_raw_parts_in(data.ptr, meta.len(), capacity, alloc);
 				IntoIterData {
 					vec: ManuallyDrop::new(vec.into_iter())
 				}
@@ -868,7 +941,7 @@ impl<'a, M: Meta, T, const N: usize> IntoIterator for CalfVec<'a, M, T, N> where
 	}
 }
 
-impl<'a, M: Meta, T, const N: usize> Extend<T> for CalfVec<'a, M, T, N> where T: Clone {
+impl<'a, M: Meta, T, A: AllocRef, const N: usize> Extend<T> for CalfVec<'a, M, T, A, N> where T: Clone {
 	#[inline]
 	fn extend<I: IntoIterator<Item = T>>(&mut self, iterator: I) {
 		let mut iterator = iterator.into_iter();
@@ -897,58 +970,58 @@ impl<'a, M: Meta, T, const N: usize> Extend<T> for CalfVec<'a, M, T, N> where T:
 	// }
 }
 
-impl<'a, M: Meta, T: fmt::Debug, const N: usize> fmt::Debug for CalfVec<'a, M, T, N> {
+impl<'a, M: Meta, T: fmt::Debug, A: AllocRef, const N: usize> fmt::Debug for CalfVec<'a, M, T, A, N> {
 	#[inline]
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		fmt::Debug::fmt(&**self, f)
 	}
 }
 
-impl<'a, M: Meta, T, const N: usize> AsRef<CalfVec<'a, M, T, N>> for CalfVec<'a, M, T, N> {
+impl<'a, M: Meta, T, A: AllocRef, const N: usize> AsRef<CalfVec<'a, M, T, A, N>> for CalfVec<'a, M, T, A, N> {
 	#[inline]
-	fn as_ref(&self) -> &CalfVec<'a, M, T, N> {
+	fn as_ref(&self) -> &CalfVec<'a, M, T, A, N> {
 		self
 	}
 }
 
-impl<'a, M: Meta, T, const N: usize> AsMut<CalfVec<'a, M, T, N>> for CalfVec<'a, M, T, N> {
+impl<'a, M: Meta, T, A: AllocRef, const N: usize> AsMut<CalfVec<'a, M, T, A, N>> for CalfVec<'a, M, T, A, N> {
 	#[inline]
-	fn as_mut(&mut self) -> &mut CalfVec<'a, M, T, N> {
+	fn as_mut(&mut self) -> &mut CalfVec<'a, M, T, A, N> {
 		self
 	}
 }
 
-impl<'a, M: Meta, T, const N: usize> AsRef<[T]> for CalfVec<'a, M, T, N> {
+impl<'a, M: Meta, T, A: AllocRef, const N: usize> AsRef<[T]> for CalfVec<'a, M, T, A, N> {
 	#[inline]
 	fn as_ref(&self) -> &[T] {
 		self
 	}
 }
 
-impl<'a, M: Meta, T, const N: usize> AsMut<[T]> for CalfVec<'a, M, T, N> where T: Clone {
+impl<'a, M: Meta, T, A: AllocRef, const N: usize> AsMut<[T]> for CalfVec<'a, M, T, A, N> where T: Clone {
 	#[inline]
 	fn as_mut(&mut self) -> &mut [T] {
 		self
 	}
 }
 
-impl<'a, M: Meta, T, const N: usize> From<Vec<T>> for CalfVec<'a, M, T, N> {
+impl<'a, M: Meta, T, A: AllocRef + Clone, const N: usize> From<Vec<T, A>> for CalfVec<'a, M, T, A, N> {
 	#[inline]
-	fn from(v: Vec<T>) -> CalfVec<'a, M, T, N> {
+	fn from(v: Vec<T, A>) -> CalfVec<'a, M, T, A, N> {
 		CalfVec::owned(v)
 	}
 }
 
-impl<'a, M: Meta, T, const N: usize> From<&'a [T]> for CalfVec<'a, M, T, N> {
+impl<'a, M: Meta, T, const N: usize> From<&'a [T]> for CalfVec<'a, M, T, Global, N> {
 	#[inline]
-	fn from(s: &'a [T]) -> CalfVec<'a, M, T, N> {
+	fn from(s: &'a [T]) -> CalfVec<'a, M, T, Global, N> {
 		CalfVec::borrowed(s)
 	}
 }
 
-impl<'a, M: Meta, T, const N: usize> From<Cow<'a, [T]>> for CalfVec<'a, M, T, N> where T: Clone {
+impl<'a, M: Meta, T, const N: usize> From<Cow<'a, [T]>> for CalfVec<'a, M, T, Global, N> where T: Clone {
 	#[inline]
-	fn from(c: Cow<'a, [T]>) -> CalfVec<'a, M, T, N> {
+	fn from(c: Cow<'a, [T]>) -> CalfVec<'a, M, T, Global, N> {
 		match c {
 			Cow::Borrowed(s) => s.into(),
 			Cow::Owned(v) => v.into()
@@ -958,7 +1031,7 @@ impl<'a, M: Meta, T, const N: usize> From<Cow<'a, [T]>> for CalfVec<'a, M, T, N>
 
 macro_rules! impl_slice_eq1 {
 	([$($vars:tt)*] $lhs:ty, $rhs:ty $(where $ty:ty: $bound:ident)?) => {
-		impl<$($vars)*> PartialEq<$rhs> for $lhs where A: PartialEq<B>, $($ty: $bound)? {
+		impl<$($vars)*> PartialEq<$rhs> for $lhs where T: PartialEq<U>, $($ty: $bound)? {
 			#[inline]
 			fn eq(&self, other: &$rhs) -> bool { self[..] == other[..] }
 			#[inline]
@@ -967,16 +1040,75 @@ macro_rules! impl_slice_eq1 {
 	}
 }
 
-impl_slice_eq1! { ['a, 'b, A, B, O: Meta, P: Meta, const N: usize, const M: usize] CalfVec<'a, O, A, N>, CalfVec<'b, P, B, M> }
-impl_slice_eq1! { ['a, A, B, M: Meta, const N: usize] CalfVec<'a, M, A, N>, Vec<B> }
-impl_slice_eq1! { ['b, A, B, M: Meta, const N: usize] Vec<A>, CalfVec<'b, M, B, N> }
-impl_slice_eq1! { ['a, A, B, M: Meta, const N: usize] CalfVec<'a, M, A, N>, &[B] }
-impl_slice_eq1! { ['a, A, B, M: Meta, const N: usize] CalfVec<'a, M, A, N>, &mut [B] }
-impl_slice_eq1! { ['b, A, B, M: Meta, const N: usize] &[A], CalfVec<'b, M, B, N> }
-impl_slice_eq1! { ['b, A, B, M: Meta, const N: usize] &mut [A], CalfVec<'b, M, B, N> }
-impl_slice_eq1! { ['a, A, B, M: Meta, const N: usize] CalfVec<'a, M, A, N>, Cow<'_, [B]> where B: Clone }
-impl_slice_eq1! { ['b, A, B, M: Meta, const N: usize] Cow<'_, [A]>, CalfVec<'b, M, B, N> where A: Clone }
-impl_slice_eq1! { ['a, A, B, M: Meta, const N: usize, const O: usize] CalfVec<'a, M, A, N>, [B; O] }
-impl_slice_eq1! { ['a, A, B, M: Meta, const N: usize, const O: usize] CalfVec<'a, M, A, N>, &[B; O] }
-impl_slice_eq1! { ['b, A, B, M: Meta, const N: usize, const O: usize] [A; O], CalfVec<'b, M, B, N> }
-impl_slice_eq1! { ['b, A, B, M: Meta, const N: usize, const O: usize] &[A; O], CalfVec<'b, M, B, N> }
+impl_slice_eq1! { ['a, 'b, T, U, O: Meta, P: Meta, A: AllocRef, B: AllocRef, const N: usize, const M: usize] CalfVec<'a, O, T, A, N>, CalfVec<'b, P, U, B, M> }
+impl_slice_eq1! { ['a, T, U, M: Meta, A: AllocRef, B: AllocRef, const N: usize] CalfVec<'a, M, T, A, N>, Vec<U, B> }
+impl_slice_eq1! { ['b, T, U, M: Meta, A: AllocRef, B: AllocRef, const N: usize] Vec<T, A>, CalfVec<'b, M, U, B, N> }
+impl_slice_eq1! { ['a, T, U, M: Meta, A: AllocRef, const N: usize] CalfVec<'a, M, T, A, N>, &[U] }
+impl_slice_eq1! { ['a, T, U, M: Meta, A: AllocRef, const N: usize] CalfVec<'a, M, T, A, N>, &mut [U] }
+impl_slice_eq1! { ['b, T, U, M: Meta, A: AllocRef, const N: usize] &[T], CalfVec<'b, M, U, A, N> }
+impl_slice_eq1! { ['b, T, U, M: Meta, A: AllocRef, const N: usize] &mut [T], CalfVec<'b, M, U, A, N> }
+impl_slice_eq1! { ['a, T, U, M: Meta, A: AllocRef, const N: usize] CalfVec<'a, M, T, A, N>, Cow<'_, [U]> where U: Clone }
+impl_slice_eq1! { ['b, T, U, M: Meta, A: AllocRef, const N: usize] Cow<'_, [T]>, CalfVec<'b, M, U, A, N> where T: Clone }
+impl_slice_eq1! { ['a, T, U, M: Meta, A: AllocRef, const N: usize, const O: usize] CalfVec<'a, M, T, A, N>, [U; O] }
+impl_slice_eq1! { ['a, T, U, M: Meta, A: AllocRef, const N: usize, const O: usize] CalfVec<'a, M, T, A, N>, &[U; O] }
+impl_slice_eq1! { ['b, T, U, M: Meta, A: AllocRef, const N: usize, const O: usize] [T; O], CalfVec<'b, M, U, A, N> }
+impl_slice_eq1! { ['b, T, U, M: Meta, A: AllocRef, const N: usize, const O: usize] &[T; O], CalfVec<'b, M, U, A, N> }
+
+impl<'a, M: Meta, T: Eq, A: AllocRef, const N: usize> Eq for CalfVec<'a, M, T, A, N> {}
+
+pub trait ToCalfVec {
+	fn to_calf_vec<M: Meta, A: AllocRef, const N: usize>(s: &[Self], alloc: A) -> CalfVec<M, Self, A, N> where Self: Sized;
+}
+
+impl<T: Clone> ToCalfVec for T {
+	#[inline]
+	default fn to_calf_vec<M: Meta, A: AllocRef, const N: usize>(s: &[Self], alloc: A) -> CalfVec<M, Self, A, N> {
+		// struct DropGuard<'a, T, A: AllocRef> {
+		// 	vec: &'a mut Vec<T, A>,
+		// 	num_init: usize,
+		// }
+		// impl<'a, T, A: AllocRef> Drop for DropGuard<'a, T, A> {
+		// 	#[inline]
+		// 	fn drop(&mut self) {
+		// 		// SAFETY:
+		// 		// items were marked initialized in the loop below
+		// 		unsafe {
+		// 			self.vec.set_len(self.num_init);
+		// 		}
+		// 	}
+		// }
+		// let mut vec = Vec::with_capacity_in(s.len(), alloc);
+		// let mut guard = DropGuard { vec: &mut vec, num_init: 0 };
+		// let slots = guard.vec.spare_capacity_mut();
+		// // .take(slots.len()) is necessary for LLVM to remove bounds checks
+		// // and has better codegen than zip.
+		// for (i, b) in s.iter().enumerate().take(slots.len()) {
+		// 	guard.num_init = i;
+		// 	slots[i].write(b.clone());
+		// }
+		// core::mem::forget(guard);
+		// // SAFETY:
+		// // the vec was allocated and initialized above to at least this length.
+		// unsafe {
+		// 	vec.set_len(s.len());
+		// }
+		// vec
+		panic!("TODO")
+	}
+}
+
+impl<T: Copy> ToCalfVec for T {
+	#[inline]
+	fn to_calf_vec<M: Meta, A: AllocRef, const N: usize>(s: &[Self], alloc: A) -> CalfVec<M, Self, A, N> {
+		// let mut v = Vec::with_capacity_in(s.len(), alloc);
+		// // SAFETY:
+		// // allocated above with the capacity of `s`, and initialize to `s.len()` in
+		// // ptr::copy_to_non_overlapping below.
+		// unsafe {
+		// 	s.as_ptr().copy_to_nonoverlapping(v.as_mut_ptr(), s.len());
+		// 	v.set_len(s.len());
+		// }
+		// v
+		panic!("TODO")
+	}
+}

@@ -45,12 +45,13 @@
 //! owned.push(32); // <- here the buffer's capacity now exceeds the given limit (32).
 //!                 //    it is hence moved on the heap, transparently.
 //! ```
-
 #![feature(min_const_generics)]
 #![feature(untagged_unions)]
 #![feature(vec_into_raw_parts)]
 #![feature(slice_partition_dedup)]
 #![feature(shrink_to)]
+#![feature(allocator_api)]
+#![feature(specialization)]
 
 pub mod generic;
 pub mod string;

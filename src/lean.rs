@@ -59,5 +59,5 @@ impl crate::generic::Meta for Meta {
 	}
 }
 
-pub type CalfVec<'a, T, const N: usize> = crate::generic::CalfVec<'a, Meta, T, N>;
-pub type CalfString<'a, const N: usize> = crate::string::CalfString<'a, Meta, N>;
+pub type CalfVec<'a, T, const N: usize> = crate::generic::CalfVec<'a, Meta, T, std::alloc::Global, N>;
+pub type CalfString<'a, const N: usize> = crate::string::CalfString<'a, Meta, std::alloc::Global, N>;
