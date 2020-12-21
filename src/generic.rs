@@ -237,17 +237,6 @@ impl<'a, M: Meta, T, A: Allocator, const N: usize> CalfVec<'a, M, T, A, N> {
 	/// Constructs a new, empty `CalfVec<M, T, A, N>`.
 	///
 	/// The vector will not allocate until more than `N` elements are pushed onto it.
-	///
-	/// # Examples
-	///
-	/// ```
-	/// #![feature(allocator_api)]
-	///
-	/// use std::alloc::System;
-	///
-	/// # #[allow(unused_mut)]
-	/// let mut vec: Vec<i32, _> = Vec::new_in(System);
-	/// ```
 	#[inline]
 	pub fn new_in(alloc: A) -> CalfVec<'a, M, T, A, N> {
 		CalfVec {
@@ -894,7 +883,7 @@ impl<'a, M: Meta, T, A: Allocator, const N: usize> CalfVec<'a, M, T, A, N> where
 		self.set_len(len + count);
 	}
 
-	/// Clones and appends all elements in a slice to the `Vec`.
+	/// Clones and appends all elements in a slice to the `CalfVec`.
 	///
 	/// Iterates over the slice `other`, clones each element, and then appends
 	/// it to this `CalfVec`. The `other` vector is traversed in-order.
