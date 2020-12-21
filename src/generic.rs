@@ -658,11 +658,11 @@ impl<'a, M: Meta, T, A: Allocator, const N: usize> CalfVec<'a, M, T, A, N> where
 			if self.needs_to_grow(additional) {
 				match self.capacity() {
 					Some(capacity) => {
-						if capacity <= N { // spilled
+						if capacity <= N { // on stack
+							self.spill_amortized(additional)
+						} else { // spilled
 							// Safe because we just checked that the data is spilled.
 							self.grow_amortized(additional)
-						} else { // on stack
-							self.spill_amortized(additional)
 						}
 					},
 					None => { // borrowed
@@ -710,11 +710,11 @@ impl<'a, M: Meta, T, A: Allocator, const N: usize> CalfVec<'a, M, T, A, N> where
 			if self.needs_to_grow(additional) {
 				match self.capacity() {
 					Some(capacity) => {
-						if capacity <= N { // spilled
+						if capacity <= N { // on stack
+							self.spill_exact(additional)
+						} else { // spilled
 							// Safe because we just checked that the data is spilled.
 							self.grow_exact(additional)
-						} else { // on stack
-							self.spill_exact(additional)
 						}
 					},
 					None => { // borrowed
@@ -883,6 +883,26 @@ impl<'a, M: Meta, T, A: Allocator, const N: usize> CalfVec<'a, M, T, A, N> where
 		self.set_len(len + count);
 	}
 
+	/// Resizes the `CalfVec` in-place so that `len` is equal to `new_len`.
+	///
+	/// If `new_len` is greater than `len`, the `CalfVec` is extended by the
+	/// difference, with each additional slot filled with `value`.
+	/// If `new_len` is less than `len`, the `CalfVec` is simply truncated.
+	///
+	/// This method requires `T` to implement [`Clone`],
+	/// in order to be able to clone the passed value.
+	/// If you need more flexibility (or want to rely on [`Default`] instead of
+	/// [`Clone`]), use [`CalfVec::resize_with`].
+	pub fn resize(&mut self, new_len: usize, value: T) {
+		let len = self.len();
+
+		if new_len > len {
+			self.extend_with(new_len - len, ExtendElement(value))
+		} else {
+			self.truncate(new_len);
+		}
+	}
+
 	/// Clones and appends all elements in a slice to the `CalfVec`.
 	///
 	/// Iterates over the slice `other`, clones each element, and then appends
@@ -1033,17 +1053,15 @@ impl<'a, M: Meta, T, A: Allocator, const N: usize> CalfVec<'a, M, T, A, N> where
 
 	/// Spill the data stored on the stack into the heap with some additional capacity.
 	/// 
-	/// The additional capacity must not be 0.
-	/// 
 	/// ## Safety
 	/// 
 	/// The caller must ensure that the data is indeed stored in the stack.
 	unsafe fn spill_amortized(&mut self, additional: usize) -> Result<(), TryReserveError> {
-		debug_assert!(additional > 0);
 		debug_assert!(self.is_owned() && !self.is_spilled());
 
-		let required_capacity = N.checked_add(additional).ok_or(TryReserveError::CapacityOverflow)?;
-		let capacity = cmp::max(N * 2, required_capacity);
+		let len = self.len();
+		let required_capacity = len.checked_add(additional).ok_or(TryReserveError::CapacityOverflow)?;
+		let capacity = cmp::max(len * 2, cmp::max(required_capacity, N+1));
 
 		let layout = match Layout::array::<T>(capacity) {
 			Ok(layout) => layout,
@@ -1068,10 +1086,10 @@ impl<'a, M: Meta, T, A: Allocator, const N: usize> CalfVec<'a, M, T, A, N> where
 	}
 
 	unsafe fn spill_exact(&mut self, additional: usize) -> Result<(), TryReserveError> {
-		debug_assert!(additional > 0);
 		debug_assert!(self.is_owned() && !self.is_spilled());
 
-		let capacity = N.checked_add(additional).ok_or(TryReserveError::CapacityOverflow)?;
+		let len = self.len();
+		let capacity = cmp::max(len.checked_add(additional).ok_or(TryReserveError::CapacityOverflow)?, N+1);
 
 		let layout = match Layout::array::<T>(capacity) {
 			Ok(layout) => layout,
@@ -1201,6 +1219,100 @@ impl<'a, M: Meta, T, A: Allocator, const N: usize> CalfVec<'a, M, T, A, N> where
 				panic!("Tried to shrink borrowed data")
 			}
 		}
+	}
+
+	/// Extend the vector by `n` values, using the given generator.
+	fn extend_with<E: ExtendWith<T>>(&mut self, n: usize, mut value: E) {
+		self.reserve(n);
+
+		unsafe {
+			let mut ptr = self.as_mut_ptr().add(self.len());
+			// Use SetLenOnDrop to work around bug where compiler
+			// may not realize the store through `ptr` through self.set_len()
+			// don't alias.
+			let mut local_len = SetLenOnDrop::new(&mut self.meta);
+
+			// Write all elements except the last one
+			for _ in 1..n {
+				ptr::write(ptr, value.next());
+				ptr = ptr.offset(1);
+				// Increment the length in every step in case next() panics
+				local_len.increment_len(1);
+			}
+
+			if n > 0 {
+				// We can write the last element directly without cloning needlessly
+				ptr::write(ptr, value.last());
+				local_len.increment_len(1);
+			}
+
+			// len set by scope guard
+		}
+	}
+}
+
+// Set the length of the vec when the `SetLenOnDrop` value goes out of scope.
+//
+// The idea is: The length field in SetLenOnDrop is a local variable
+// that the optimizer will see does not alias with any stores through the Vec's data
+// pointer. This is a workaround for alias analysis issue #32155
+struct SetLenOnDrop<'a, M: Meta> {
+	meta: &'a mut M,
+	local_len: usize,
+}
+
+impl<'a, M: Meta> SetLenOnDrop<'a, M> {
+	#[inline]
+	fn new(meta: &'a mut M) -> Self {
+		SetLenOnDrop { local_len: meta.len(), meta }
+	}
+
+	#[inline]
+	fn increment_len(&mut self, increment: usize) {
+		self.local_len += increment;
+	}
+}
+
+impl<M: Meta> Drop for SetLenOnDrop<'_, M> {
+	#[inline]
+	fn drop(&mut self) {
+		self.meta.set_len(self.local_len);
+	}
+}
+
+// This code generalizes `extend_with_{element,default}`.
+trait ExtendWith<T> {
+	fn next(&mut self) -> T;
+	fn last(self) -> T;
+}
+
+struct ExtendElement<T>(T);
+impl<T: Clone> ExtendWith<T> for ExtendElement<T> {
+	fn next(&mut self) -> T {
+		self.0.clone()
+	}
+	fn last(self) -> T {
+		self.0
+	}
+}
+
+struct ExtendDefault;
+impl<T: Default> ExtendWith<T> for ExtendDefault {
+	fn next(&mut self) -> T {
+		Default::default()
+	}
+	fn last(self) -> T {
+		Default::default()
+	}
+}
+
+struct ExtendFunc<F>(F);
+impl<T, F: FnMut() -> T> ExtendWith<T> for ExtendFunc<F> {
+	fn next(&mut self) -> T {
+		(self.0)()
+	}
+	fn last(mut self) -> T {
+		(self.0)()
 	}
 }
 
