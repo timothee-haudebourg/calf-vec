@@ -1,19 +1,41 @@
-use std::{
+use core::{
 	alloc::{
-		AllocRef,
-		Global
+		Allocator,
+		Layout,
+		LayoutError
 	},
 	marker::PhantomData,
-	mem::ManuallyDrop,
-	ptr,
+	mem::{
+		self,
+		ManuallyDrop,
+		MaybeUninit
+	},
+	ptr::{
+		self,
+		NonNull
+	},
 	ops::{
 		Deref,
 		DerefMut
 	},
-	borrow::Cow,
 	fmt,
 	cmp
 };
+use std::{
+	alloc::{
+		Global,
+		handle_alloc_error
+	},
+	collections::TryReserveError,
+	borrow::Cow
+};
+
+enum AllocInit {
+	/// The contents of the new memory are uninitialized.
+	Uninitialized,
+	/// The new memory is guaranteed to be zeroed.
+	Zeroed,
+}
 
 /// Metadata representing the length and capacity of the array.
 ///
@@ -51,34 +73,62 @@ pub trait Meta: Copy {
 /// If the data is borrowed or spilled, the the relevent field is `ptr`.
 union Data<T, const N: usize> {
 	/// Data stored on the stack.
-	stack: ManuallyDrop<[T; N]>,
+	stack: ManuallyDrop<[MaybeUninit<T>; N]>,
 
 	/// Pointer to the data (either borrowed, or owned on the heap).
-	ptr: *mut T
+	ptr: NonNull<T>
 }
 
 impl<T, const N: usize> Data<T, N> {
 	#[inline]
-	fn new() -> Data<T, N> {
+	const fn dangling() -> Data<T, N> {
 		Data {
-			ptr: ptr::null_mut()
+			ptr: NonNull::dangling()
 		}
 	}
 
 	#[inline]
-	unsafe fn drop_with<M: Meta, A: AllocRef>(&mut self, meta: M, alloc: &A) {
+	fn new(init: AllocInit) -> Data<T, N> {
+		match init {
+			AllocInit::Uninitialized => {
+				Data {
+					stack: ManuallyDrop::new(
+						// SAFETY: An uninitialized `[MaybeUninit<_>; N]` is valid.
+						unsafe { MaybeUninit::<[MaybeUninit<T>; N]>::uninit().assume_init() }
+					)
+				}
+			},
+			AllocInit::Zeroed => {
+				Data {
+					stack: ManuallyDrop::new(
+						// SAFETY: An uninitialized `[MaybeUninit<_>; N]` is valid.
+						unsafe { MaybeUninit::<[MaybeUninit<T>; N]>::zeroed().assume_init() }
+					)
+				}
+			}
+		}
+	}
+
+	#[inline]
+	unsafe fn drop_with<M: Meta, A: Allocator>(&mut self, meta: M, alloc: &A) {
 		match meta.capacity() {
 			Some(capacity) => {
 				let len = meta.len();
-				if capacity <= N {
-					// stacked
+				if capacity <= N { // stacked
+					// drop every element.
 					ptr::drop_in_place(&mut (*self.stack)[0..len]);
-				} else {
-					// spilled
-					Vec::from_raw_parts_in(self.ptr, len, capacity, alloc);
+				} else { // spilled
+					// drop every element.
+					ptr::drop_in_place(ptr::slice_from_raw_parts_mut(self.ptr.as_ptr(), len)); 
+
+					// free memory.
+					let align = std::mem::align_of::<T>();
+					let size = std::mem::size_of::<T>() * capacity;
+					let layout = std::alloc::Layout::from_size_align_unchecked(size, align);
+					alloc.deallocate(self.ptr.cast(), layout)
 				}
 			},
-			None => ()
+			None => () // borrowed
 		}
 	}
 }
@@ -114,7 +164,7 @@ impl<T, const N: usize> Data<T, N> {
 /// # use calf_vec::CalfVec;
 /// let owned: CalfVec<'_, u8, 32> = CalfVec::owned(vec![1, 2, 3]);
 /// ```
-pub struct CalfVec<'a, M: Meta, T, A: AllocRef, const N: usize> {
+pub struct CalfVec<'a, M: Meta, T, A: Allocator, const N: usize> {
 	/// Metadata storing the length and capacity of the array.
 	meta: M,
 
@@ -128,7 +178,7 @@ pub struct CalfVec<'a, M: Meta, T, A: AllocRef, const N: usize> {
 	lifetime: PhantomData<&'a T>
 }
 
-impl<'a, M: Meta, T, A: AllocRef, const N: usize> Drop for CalfVec<'a, M, T, A, N> {
+impl<'a, M: Meta, T, A: Allocator, const N: usize> Drop for CalfVec<'a, M, T, A, N> {
 	fn drop(&mut self) {
 		unsafe {
 			self.data.drop_with(self.meta, &self.alloc)
@@ -142,33 +192,16 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, Global, N> {
 	/// The vector will not allocate until more than `N` elements are pushed onto it.
 	// TODO make this function `const` as soon as the `const_fn` feature allows it.
 	#[inline]
-	pub fn new() -> CalfVec<'a, M, T, Global, N> {
-		CalfVec {
-			meta: M::new(0, Some(N)),
-			data: Data::new(),
-			alloc: Global,
-			lifetime: PhantomData
-		}
+	pub fn new() -> Self {
+		Self::new_in(Global)
 	}
 
 	/// Creates a new empty `CalfVec` with a particular capacity.
 	///
 	/// The actual capacity of the created `CalfVec` will be at least `N`.
 	#[inline]
-	pub fn with_capacity(capacity: usize) -> CalfVec<'a, M, T, Global, N> {
-		if capacity <= N {
-			CalfVec::new()
-		} else {
-			let vec = Vec::with_capacity(capacity);
-			let (ptr, _, actual_capacity) = vec.into_raw_parts();
-
-			CalfVec {
-				meta: M::new(0, Some(actual_capacity)),
-				data: Data { ptr },
-				alloc: Global,
-				lifetime: PhantomData
-			}
-		}
+	pub fn with_capacity(capacity: usize) -> Self {
+		Self::with_capacity_in(capacity, Global)
 	}
 
 	/// Create a new `CalfVec` from borrowed data.
@@ -185,19 +218,22 @@ impl<'a, M: Meta, T, const N: usize> CalfVec<'a, M, T, Global, N> {
 	/// assert_eq!(calf, [4, 2, 3])
 	/// ```
 	#[inline]
-	pub fn borrowed<B: AsRef<[T]> + ?Sized>(borrowed: &'a B) -> CalfVec<'a, M, T, Global, N> {
-		let slice = borrowed.as_ref();
-
-		CalfVec {
-			meta: M::new(slice.len(), None),
-			data: Data { ptr: slice.as_ptr() as *mut T },
-			alloc: Global,
-			lifetime: PhantomData
-		}
+	pub fn borrowed<B: AsRef<[T]> + ?Sized>(borrowed: &'a B) -> Self {
+		Self::borrowed_in(borrowed, Global)
 	}
 }
 
-impl<'a, M: Meta, T, A: AllocRef, const N: usize> CalfVec<'a, M, T, A, N> {
+impl<'a, M: Meta, T, A: Allocator, const N: usize> CalfVec<'a, M, T, A, N> {
+	/// Initialize a new `CalfVec` of capacity `N` on the stack.
+	fn init_in(init: AllocInit, alloc: A) -> Self {
+		CalfVec {
+			meta: M::new(0, Some(N)),
+			data: Data::new(init),
+			alloc,
+			lifetime: PhantomData
+		}
+	}
+
 	/// Constructs a new, empty `CalfVec<M, T, A, N>`.
 	///
 	/// The vector will not allocate until more than `N` elements are pushed onto it.
@@ -216,7 +252,73 @@ impl<'a, M: Meta, T, A: AllocRef, const N: usize> CalfVec<'a, M, T, A, N> {
 	pub fn new_in(alloc: A) -> CalfVec<'a, M, T, A, N> {
 		CalfVec {
 			meta: M::new(0, Some(N)),
-			data: Data::new(),
+			data: Data::new(AllocInit::Uninitialized),
+			alloc,
+			lifetime: PhantomData
+		}
+	}
+
+	fn allocate_in(capacity: usize, init: AllocInit, alloc: A) -> Self {
+		if mem::size_of::<T>() == 0 {
+			Self::new_in(alloc)
+		} else {
+			let meta = M::new(0, Some(capacity));
+
+			let layout = match Layout::array::<T>(capacity) {
+				Ok(layout) => layout,
+				Err(_) => capacity_overflow(),
+			};
+			match alloc_guard(layout.size()) {
+				Ok(_) => {}
+				Err(_) => capacity_overflow(),
+			}
+			let result = match init {
+				AllocInit::Uninitialized => alloc.allocate(layout),
+				AllocInit::Zeroed => alloc.allocate_zeroed(layout),
+			};
+			let ptr = match result {
+				Ok(ptr) => ptr,
+				Err(_) => handle_alloc_error(layout),
+			};
+
+			Self {
+				meta,
+				data: Data { ptr: ptr.cast() },
+				alloc,
+				lifetime: PhantomData
+			}
+		}
+	}
+
+	/// Like `with_capacity`, but parameterized over the choice of
+	/// allocator for the returned `RawVec`.
+	#[inline]
+	pub fn with_capacity_in(capacity: usize, alloc: A) -> Self {
+		if capacity <= N {
+			Self::init_in(AllocInit::Uninitialized, alloc)
+		} else {
+			Self::allocate_in(capacity, AllocInit::Uninitialized, alloc)
+		}
+	}
+
+	/// Like `with_capacity_zeroed`, but parameterized over the choice
+	/// of allocator for the returned `RawVec`.
+	#[inline]
+	pub fn with_capacity_zeroed_in(capacity: usize, alloc: A) -> Self {
+		if capacity <= N {
+			Self::init_in(AllocInit::Zeroed, alloc)
+		} else {
+			Self::allocate_in(capacity, AllocInit::Zeroed, alloc)
+		}
+	}
+
+	#[inline]
+	pub fn borrowed_in<B: AsRef<[T]> + ?Sized>(borrowed: &'a B, alloc: A) -> Self {
+		let slice = borrowed.as_ref();
+
+		CalfVec {
+			meta: M::new(slice.len(), None),
+			data: Data { ptr: unsafe { NonNull::new_unchecked(slice.as_ptr() as *mut T) } },
 			alloc,
 			lifetime: PhantomData
 		}
@@ -229,14 +331,14 @@ impl<'a, M: Meta, T, A: AllocRef, const N: usize> CalfVec<'a, M, T, A, N> {
 	#[inline]
 	pub fn owned<O: Into<Vec<T, A>>>(owned: O) -> CalfVec<'a, M, T, A, N> where A: Clone {
 		let vec = owned.into();
-		let alloc = vec.alloc_ref().clone();
+		let alloc = vec.allocator().clone();
 		let (ptr, len, capacity) = vec.into_raw_parts();
+
 		if capacity <= N {
 			// put on stack
 			unsafe {
-				let mut data = Data { ptr: ptr::null_mut() };
-				std::ptr::copy_nonoverlapping(ptr, (*data.stack).as_mut_ptr(), len);
-				Vec::from_raw_parts(ptr, 0, capacity); // destroy the original vec without touching its content.
+				let mut data = Data::dangling();
+				std::ptr::copy_nonoverlapping(ptr, (*data.stack).as_mut_ptr().cast(), len);
 
 				CalfVec {
 					meta: M::new(len, Some(N)),
@@ -249,7 +351,7 @@ impl<'a, M: Meta, T, A: AllocRef, const N: usize> CalfVec<'a, M, T, A, N> {
 			// put on heap
 			CalfVec {
 				meta: M::new(len, Some(capacity)),
-				data: Data { ptr },
+				data: Data { ptr: unsafe { NonNull::new_unchecked(ptr) } },
 				alloc,
 				lifetime: PhantomData
 			}
@@ -258,8 +360,32 @@ impl<'a, M: Meta, T, A: AllocRef, const N: usize> CalfVec<'a, M, T, A, N> {
 
 	/// Returns a reference to the underlying allocator.
 	#[inline]
-	pub fn alloc_ref(&self) -> &A {
+	pub fn allocator(&self) -> &A {
 		&self.alloc
+	}
+
+	/// Returns the current allocated memory and layout.
+	///
+	/// Returns `None` if the data is borrowed, on the stack,
+	/// or is the size of `T` is 0.
+	fn current_memory(&self) -> Option<(NonNull<u8>, Layout)> {
+		match self.capacity() {
+			None => None,
+			Some(capacity) => {
+				if capacity <= N {
+					None
+				} else {
+					// We have an allocated chunk of memory, so we can bypass runtime
+					// checks to get our current layout.
+					unsafe {
+						let align = mem::align_of::<T>();
+						let size = mem::size_of::<T>() * capacity;
+						let layout = Layout::from_size_align_unchecked(size, align);
+						Some((self.data.ptr.cast().into(), layout))
+					}
+				}
+			}
+		}
 	}
 
 	/// Try to convert this `CalfVec` into a borrowed slice.
@@ -312,7 +438,7 @@ impl<'a, M: Meta, T, A: AllocRef, const N: usize> CalfVec<'a, M, T, A, N> {
 				let ptr = self.data.ptr;
 				let len = self.len();
 				std::mem::forget(self); // there is nothing left to drop in `self`, we can forget it.
-				Ok(Vec::from_raw_parts_in(ptr, len, capacity, alloc))
+				Ok(Vec::from_raw_parts_in(ptr.as_ptr(), len, capacity, alloc))
 			},
 			_ => Err(self)
 		}
@@ -330,13 +456,13 @@ impl<'a, M: Meta, T, A: AllocRef, const N: usize> CalfVec<'a, M, T, A, N> {
 			let len = self.len();
 			let alloc = ptr::read(&self.alloc); // this is safe because `self.alloc` is never used ever after.
 			let vec = if capacity <= N {
-				let src = (*self.data.stack).as_mut_ptr();
+				let src = (*self.data.stack).as_mut_ptr() as *mut T;
 				let mut vec = Vec::with_capacity_in(len, alloc);
 				std::ptr::copy_nonoverlapping(src, vec.as_mut_ptr(), len);
 				vec
 			} else {
 				let ptr = self.data.ptr;
-				Vec::from_raw_parts_in(ptr, len, capacity, alloc)
+				Vec::from_raw_parts_in(ptr.as_ptr(), len, capacity, alloc)
 			};
 			std::mem::forget(self); // there is nothing left to drop in `self`, we can forget it.
 			vec
@@ -359,13 +485,26 @@ impl<'a, M: Meta, T, A: AllocRef, const N: usize> CalfVec<'a, M, T, A, N> {
 			match self.capacity() {
 				Some(capacity) => {
 					if capacity <= N {
-						(*self.data.stack).as_ptr()
+						(*self.data.stack).as_ptr() as *const T
 					} else {
-						self.data.ptr
+						self.data.ptr.as_ptr()
 					}
 				},
-				None => self.data.ptr
+				None => self.data.ptr.as_ptr()
 			}
+		}
+	}
+
+	/// Returns an unsafe mutable pointer to the owned vector's buffer.
+	///
+	/// Same as [`as_mut_ptr`] but the caller must ensure that the data is owned by the vector.
+	#[inline]
+	pub unsafe fn owned_as_mut_ptr(&mut self) -> *mut T {
+		let capacity = self.capacity().unwrap();
+		if capacity <= N {
+			(*self.data.stack).as_mut_ptr() as *mut T
+		} else {
+			self.data.ptr.as_ptr()
 		}
 	}
 
@@ -382,13 +521,23 @@ impl<'a, M: Meta, T, A: AllocRef, const N: usize> CalfVec<'a, M, T, A, N> {
 	/// Returns true if the data is owned, i.e. if `to_mut` would be a no-op.
 	#[inline]
 	pub fn is_owned(&self) -> bool {
-		self.meta.capacity().is_some()
+		self.capacity().is_some()
 	}
 
 	/// Returns true if the data is borrowed, i.e. if `to_mut` would require additional work.
 	#[inline]
 	pub fn is_borrowed(&self) -> bool {
-		self.meta.capacity().is_none()
+		self.capacity().is_none()
+	}
+
+	/// Returns `true` if the data is owned and stored on the heap,
+	/// `false` if it is borrowed or stored on the stack.
+	#[inline]
+	pub fn is_spilled(&self) -> bool {
+		match self.capacity() {
+			Some(capacity) => capacity > N,
+			None => false
+		}
 	}
 
 	/// Returns the length of the array.
@@ -397,35 +546,64 @@ impl<'a, M: Meta, T, A: AllocRef, const N: usize> CalfVec<'a, M, T, A, N> {
 		self.meta.len()
 	}
 
+	#[inline]
+	pub unsafe fn set_len(&mut self, len: usize) {
+		self.meta.set_len(len)
+	}
+
 	/// Returns the capacity of the owned buffer, or `None` if the data is only borrowed.
 	#[inline]
 	pub fn capacity(&self) -> Option<usize> {
-		self.meta.capacity()
+		if mem::size_of::<T>() == 0 {
+			Some(usize::MAX)
+		} else {
+			self.meta.capacity()
+		}
+	}
+
+	/// Returns the remaining spare capacity of the vector as a slice of
+	/// `MaybeUninit<T>`.
+	///
+	/// The returned slice can be used to fill the vector with data (e.g. by
+	/// reading from a file) before marking the data as initialized using the
+	/// [`set_len`] method.
+	///
+	/// [`set_len`]: CalfVec::set_len
+	#[inline]
+	pub fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<T>] {
+		let len = self.len();
+		match self.capacity() {
+			Some(capacity) => unsafe {
+				let ptr = if capacity <= N {
+					(*self.data.stack).as_mut_ptr()
+				} else {
+					self.data.ptr.as_ptr() as *mut MaybeUninit<T>
+				};
+
+				std::slice::from_raw_parts_mut(ptr.add(len), capacity - len)
+			},
+			None => {
+				&mut []
+			}
+		}
 	}
 }
 
-impl<'a, M: Meta, T, A: AllocRef, const N: usize> CalfVec<'a, M, T, A, N> where T: Clone {
+impl<'a, M: Meta, T, A: Allocator, const N: usize> CalfVec<'a, M, T, A, N> where T: Clone {
 	#[inline]
 	pub fn own(&mut self) -> usize {
 		match self.capacity() {
 			Some(capacity) => capacity,
 			None => unsafe { // copy time!
 				let len = self.len();
-				let slice = std::slice::from_raw_parts(self.data.ptr, len);
+				let slice = std::slice::from_raw_parts(self.data.ptr.as_ptr(), len);
 
-				let capacity = if len <= N {
-					// clone on stack
-					&mut (*self.data.stack)[0..len].clone_from_slice(slice); // FIXME
-					N
-				} else {
-					// clone on heap
-					let (ptr, _, capacity) = self.as_slice().to_vec_in(self.alloc).into_raw_parts();
-					self.data.ptr = ptr;
-					capacity
-				};
+				let alloc = ptr::read(&self.alloc); // this is safe because `self.alloc` is never used ever after.
+				let mut vec = T::to_calf_vec(slice, alloc);
+				std::mem::swap(&mut vec, self);
+				std::mem::forget(vec);
 
-				self.meta.set_capacity(Some(capacity));
-				capacity
+				self.capacity().unwrap()
 			}
 		}
 	}
@@ -441,9 +619,9 @@ impl<'a, M: Meta, T, A: AllocRef, const N: usize> CalfVec<'a, M, T, A, N> where 
 		let capacity = self.own();
 		unsafe {
 			if capacity <= N {
-				(*self.data.stack).as_mut_ptr()
+				(*self.data.stack).as_mut_ptr() as *mut T
 			} else {
-				self.data.ptr
+				self.data.ptr.as_ptr()
 			}
 		}
 	}
@@ -457,11 +635,6 @@ impl<'a, M: Meta, T, A: AllocRef, const N: usize> CalfVec<'a, M, T, A, N> where 
 		unsafe {
 			std::slice::from_raw_parts_mut(self.as_mut_ptr(), self.len())
 		}
-	}
-
-	#[inline]
-	pub(crate) unsafe fn set_len(&mut self, len: usize) {
-		self.meta.set_len(len)
 	}
 
 	/// Shortens the vector, keeping the first `len` elements and dropping
@@ -490,6 +663,29 @@ impl<'a, M: Meta, T, A: AllocRef, const N: usize> CalfVec<'a, M, T, A, N> where 
 		}
 	}
 
+	/// The same as `reserve`, but returns on errors instead of panicking or aborting.
+	pub fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError> {
+		unsafe {
+			if self.needs_to_grow(additional) {
+				match self.capacity() {
+					Some(capacity) => {
+						if capacity <= N { // spilled
+							// Safe because we just checked that the data is spilled.
+							self.grow_amortized(additional)
+						} else { // on stack
+							self.spill_amortized(additional)
+						}
+					},
+					None => { // borrowed
+						self.import_amortized(additional)
+					}
+				}
+			} else {
+				Ok(())
+			}
+		}
+	}
+
 	/// Reserves capacity for at least `additional` more elements to be inserted
 	/// in the given `CalfVec<T>`. The collection may reserve more space to avoid
 	/// frequent reallocations. After calling `reserve`, capacity will be
@@ -500,19 +696,7 @@ impl<'a, M: Meta, T, A: AllocRef, const N: usize> CalfVec<'a, M, T, A, N> where 
 	///
 	/// Panics if the new capacity exceeds `M::MAX_LENGTH` bytes.
 	pub fn reserve(&mut self, additional: usize) {
-		let capacity = self.own();
-		unsafe {
-			let mut vec = if capacity <= N {
-				self.spill()
-			} else {
-				Vec::from_raw_parts_in(self.data.ptr, self.len(), capacity, self.alloc)
-			};
-
-			vec.reserve(additional);
-			let (ptr, _, capacity) = vec.into_raw_parts();
-			self.data.ptr = ptr;
-			self.meta.set_capacity(Some(capacity));
-		}
+		handle_reserve(self.try_reserve(additional))
 	}
 
 	/// Reserves the minimum capacity for exactly `additional` more elements to
@@ -528,41 +712,69 @@ impl<'a, M: Meta, T, A: AllocRef, const N: usize> CalfVec<'a, M, T, A, N> where 
 	///
 	/// Panics if the new capacity overflows `usize`.
 	pub fn reserve_exact(&mut self, additional: usize) {
-		let capacity = self.own();
-		unsafe {
-			let mut vec = if capacity <= N {
-				self.spill()
-			} else {
-				Vec::from_raw_parts_in(self.data.ptr, self.len(), capacity, self.alloc)
-			};
+		handle_reserve(self.try_reserve_exact(additional))
+	}
 
-			vec.reserve_exact(additional);
-			let (ptr, _, capacity) = vec.into_raw_parts();
-			self.data.ptr = ptr;
-			self.meta.set_capacity(Some(capacity));
+	/// The same as `reserve`, but returns on errors instead of panicking or aborting.
+	pub fn try_reserve_exact(&mut self, additional: usize) -> Result<(), TryReserveError> {
+		unsafe {
+			if self.needs_to_grow(additional) {
+				match self.capacity() {
+					Some(capacity) => {
+						if capacity <= N { // spilled
+							// Safe because we just checked that the data is spilled.
+							self.grow_exact(additional)
+						} else { // on stack
+							self.spill_exact(additional)
+						}
+					},
+					None => { // borrowed
+						self.import_exact(additional)
+					}
+				}
+			} else {
+				Ok(())
+			}
 		}
 	}
 
-	/// Move the data on the stack.
-	///
-	/// The data must already be owned, and on the stack.
-	/// 
-	/// Returns a `Vec` holding the data.
-	/// The returned `Vec` **must not be dropped**.
-	#[inline]
-	unsafe fn spill(&mut self) -> Vec<T, A> {
-		let mut data = Data {
-			ptr: ptr::null_mut()
-		};
+	/// The same as `shrink_to`, but returns on errors instead of panicking or aborting.
+	pub fn try_shrink_to(&mut self, min_capacity: usize) -> Result<(), TryReserveError> {
+		let len = self.len();
+		match self.capacity() {
+			Some(capacity) => unsafe {
+				assert!(min_capacity <= capacity);
 
-		std::mem::swap(&mut data, &mut self.data);
+				let new_capacity = cmp::max(len, min_capacity);
 
-		let boxed_slice: Box<[T], A> = Box::new_in(ManuallyDrop::into_inner(data.stack), self.alloc);
-		let mut vec = boxed_slice.into_vec();
+				if capacity <= N { // stacked.
+					Ok(()) // nothing to do.
+				} else { // spilled.
+					if new_capacity <= N { // put back on stack.
+						// move to stack.
+						let ptr = self.data.ptr;
+						let src = ptr.as_ptr();
+						let dst = (*self.data.stack).as_mut_ptr() as *mut T;
+						ptr::copy_nonoverlapping(src, dst, len);
+						self.meta.set_capacity(Some(N));
 
-		self.data.ptr = vec.as_mut_ptr();
+						// free allocated memory.
+						let align = std::mem::align_of::<T>();
+						let size = std::mem::size_of::<T>() * capacity;
+						let layout = std::alloc::Layout::from_size_align_unchecked(size, align);
+						self.alloc.deallocate(ptr.cast(), layout);
 
-		vec
+						Ok(())
+					} else { // shrink allocated memory.
+						self.shrink(min_capacity)
+					}
+				}
+			},
+			None => {
+				assert!(min_capacity <= len);
+				Ok(())
+			}
+		}
 	}
 
 	/// Shrinks the capacity of the vector with a lower bound.
@@ -579,34 +791,8 @@ impl<'a, M: Meta, T, A: AllocRef, const N: usize> CalfVec<'a, M, T, A, N> where 
 	///
 	/// Panics if the current capacity is smaller than the supplied
 	/// minimum capacity.
-	pub fn shrink_to(&mut self, min_capacity: usize) where A: Clone {
-		// FIXME remove the `Clone` bound in `A` by not using `Vec::from_raw_parts_in`.
-		match self.capacity() {
-			Some(capacity) => unsafe {
-				assert!(capacity < min_capacity);
-				let len = self.len();
-				let new_capacity = cmp::max(len, min_capacity);
-
-				if new_capacity != capacity {
-					if new_capacity <= N {
-						if capacity > N {
-							// put back on the stack.
-							let ptr = self.data.ptr;
-							ptr::copy_nonoverlapping(ptr, (*self.data.stack).as_mut_ptr(), len);
-							Vec::from_raw_parts_in(ptr, 0, capacity, self.alloc.clone()); // drop the vec without touching its content.
-							self.meta.set_capacity(Some(N));
-						}
-					} else {
-						let mut vec = Vec::from_raw_parts_in(self.data.ptr, len, capacity, self.alloc.clone());
-						vec.shrink_to(new_capacity);
-						let (ptr, _, actual_new_capacity) = vec.into_raw_parts();
-						self.data.ptr = ptr;
-						self.meta.set_capacity(Some(actual_new_capacity));
-					}
-				}
-			},
-			None => ()
-		}
+	pub fn shrink_to(&mut self, min_capacity: usize) {
+		handle_reserve(self.try_shrink_to(min_capacity))
 	}
 
 	/// Shrinks the capacity of the vector as much as possible.
@@ -614,8 +800,7 @@ impl<'a, M: Meta, T, A: AllocRef, const N: usize> CalfVec<'a, M, T, A, N> where 
 	/// It will drop down as close as possible to the length but the allocator
 	/// may still inform the vector that there is space for a few more elements.
 	#[inline]
-	pub fn shrink_to_fit(&mut self) where A: Clone {
-		// FIXME remove the `Clone` bound in `A` by not using `Vec::from_raw_parts_in` in `shrink_to`.
+	pub fn shrink_to_fit(&mut self) {
 		self.shrink_to(self.len());
 	}
 
@@ -803,28 +988,280 @@ impl<'a, M: Meta, T, A: AllocRef, const N: usize> CalfVec<'a, M, T, A, N> where 
 	}
 }
 
-impl<'a, M: Meta, T: Clone, A: AllocRef + Clone, const N: usize> Clone for CalfVec<'a, M, T, A, N> {
+impl<'a, M: Meta, T, A: Allocator, const N: usize> CalfVec<'a, M, T, A, N> where T: Clone {
+	/// Returns if the buffer needs to grow to fulfill the needed extra capacity.
+	/// Mainly used to make inlining reserve-calls possible without inlining `grow`.
+	fn needs_to_grow(&self, additional: usize) -> bool {
+		match self.capacity() {
+			Some(capacity) => {
+				additional > capacity.wrapping_sub(self.len())
+			},
+			None => true
+		}
+	}
+
+	fn capacity_from_bytes(excess: usize) -> usize {
+		debug_assert_ne!(mem::size_of::<T>(), 0);
+		excess / mem::size_of::<T>()
+	}
+
+	fn set_ptr(&mut self, ptr: NonNull<[u8]>) {
+		self.data.ptr = ptr.cast();
+		self.meta.set_capacity(Some(Self::capacity_from_bytes(ptr.len())));
+	}
+
+	/// Import the borrowed data.
+	/// 
+	/// ## Safety
+	/// 
+	/// The caller must ensure that the data is indeed borrowed.
+	unsafe fn import_amortized(&mut self, additional: usize) -> Result<(), TryReserveError> {
+		debug_assert!(self.is_borrowed());
+
+		let required_capacity = self.len().checked_add(additional).ok_or(TryReserveError::CapacityOverflow)?;
+		let capacity = cmp::max(self.len() * 2, required_capacity);
+
+		let alloc = ptr::read(&self.alloc); // this is safe because `self.alloc` is never used ever after.
+		let mut vec: Self = T::to_calf_vec_with_capacity(self.as_slice(), capacity, alloc);
+		mem::swap(self, &mut vec);
+		mem::forget(vec);
+
+		Ok(())
+	}
+
+	unsafe fn import_exact(&mut self, additional: usize) -> Result<(), TryReserveError> {
+		debug_assert!(self.is_borrowed());
+
+		let capacity = self.len().checked_add(additional).ok_or(TryReserveError::CapacityOverflow)?;
+
+		let alloc = ptr::read(&self.alloc); // this is safe because `self.alloc` is never used ever after.
+		let mut vec: Self = T::to_calf_vec_with_capacity(self.as_slice(), capacity, alloc);
+		mem::swap(self, &mut vec);
+		mem::forget(vec);
+
+		Ok(())
+	}
+
+	/// Spill the data stored on the stack into the heap with some additional capacity.
+	/// 
+	/// The additional capacity must not be 0.
+	/// 
+	/// ## Safety
+	/// 
+	/// The caller must ensure that the data is indeed stored in the stack.
+	unsafe fn spill_amortized(&mut self, additional: usize) -> Result<(), TryReserveError> {
+		debug_assert!(additional > 0);
+		debug_assert!(self.is_owned() && !self.is_spilled());
+
+		let required_capacity = N.checked_add(additional).ok_or(TryReserveError::CapacityOverflow)?;
+		let capacity = cmp::max(N * 2, required_capacity);
+
+		let layout = match Layout::array::<T>(capacity) {
+			Ok(layout) => layout,
+			Err(_) => capacity_overflow(),
+		};
+		match alloc_guard(layout.size()) {
+			Ok(_) => {}
+			Err(_) => capacity_overflow(),
+		}
+		let result = self.alloc.allocate(layout);
+		let dst = match result {
+			Ok(ptr) => ptr,
+			Err(_) => handle_alloc_error(layout),
+		};
+
+		let src = self.as_slice();
+		src.as_ptr().copy_to_nonoverlapping(dst.as_ptr().cast(), N);
+
+		self.set_ptr(dst);
+
+		Ok(())
+	}
+
+	unsafe fn spill_exact(&mut self, additional: usize) -> Result<(), TryReserveError> {
+		debug_assert!(additional > 0);
+		debug_assert!(self.is_owned() && !self.is_spilled());
+
+		let capacity = N.checked_add(additional).ok_or(TryReserveError::CapacityOverflow)?;
+
+		let layout = match Layout::array::<T>(capacity) {
+			Ok(layout) => layout,
+			Err(_) => capacity_overflow(),
+		};
+		match alloc_guard(layout.size()) {
+			Ok(_) => {}
+			Err(_) => capacity_overflow(),
+		}
+		let result = self.alloc.allocate(layout);
+		let dst = match result {
+			Ok(ptr) => ptr,
+			Err(_) => handle_alloc_error(layout),
+		};
+
+		let src = self.as_slice();
+		src.as_ptr().copy_to_nonoverlapping(dst.as_ptr().cast(), N);
+
+		self.set_ptr(dst);
+
+		Ok(())
+	}
+
+	/// Grow the memory allocated on the heap.
+	/// 
+	/// ## Safety
+	/// 
+	/// The caller must ensure that the data is owned and stored on the heap (spilled).
+	unsafe fn grow_amortized(&mut self, additional: usize) -> Result<(), TryReserveError> {
+		// This is ensured by the calling contexts.
+		debug_assert!(additional > 0);
+		debug_assert!(self.is_spilled());
+
+		if mem::size_of::<T>() == 0 {
+			// Since we return a capacity of `usize::MAX` when `elem_size` is
+			// 0, getting to here necessarily means the `RawVec` is overfull.
+			return Err(TryReserveError::CapacityOverflow);
+		}
+
+		let len = self.len();
+
+		// Nothing we can really do about these checks, sadly.
+		let required_cap = len.checked_add(additional).ok_or(TryReserveError::CapacityOverflow)?;
+
+		match self.capacity() {
+			Some(capacity) => {
+				// This guarantees exponential growth. The doubling cannot overflow
+				// because `cap <= isize::MAX` and the type of `cap` is `usize`.
+				let cap = cmp::max(capacity * 2, required_cap);
+
+				// Tiny Vecs are dumb. Skip to:
+				// - 8 if the element size is 1, because any heap allocators is likely
+				//   to round up a request of less than 8 bytes to at least 8 bytes.
+				// - 4 if elements are moderate-sized (<= 1 KiB).
+				// - 1 otherwise, to avoid wasting too much space for very short Vecs.
+				// Note that `min_non_zero_cap` is computed statically.
+				let elem_size = mem::size_of::<T>();
+				let min_non_zero_cap = if elem_size == 1 {
+					8
+				} else if elem_size <= 1024 {
+					4
+				} else {
+					1
+				};
+				let cap = cmp::max(min_non_zero_cap, cap);
+
+				let new_layout = Layout::array::<T>(cap);
+
+				// `finish_grow` is non-generic over `T`.
+				let ptr = finish_grow(new_layout, self.current_memory(), &mut self.alloc)?;
+				self.set_ptr(ptr);
+				Ok(())
+			},
+			None => {
+				panic!("cannot grow a borrowed slice")
+			}
+		}
+	}
+
+	// The constraints on this method are much the same as those on
+	// `grow_amortized`, but this method is usually instantiated less often so
+	// it's less critical.
+	unsafe fn grow_exact(&mut self, additional: usize) -> Result<(), TryReserveError> {
+		debug_assert!(self.is_spilled());
+
+		if mem::size_of::<T>() == 0 {
+			// Since we return a capacity of `usize::MAX` when the type size is
+			// 0, getting to here necessarily means the `RawVec` is overfull.
+			return Err(TryReserveError::CapacityOverflow);
+		}
+
+		let len = self.len();
+		let cap = len.checked_add(additional).ok_or(TryReserveError::CapacityOverflow)?;
+		let new_layout = Layout::array::<T>(cap);
+
+		// `finish_grow` is non-generic over `T`.
+		let ptr = finish_grow(new_layout, self.current_memory(), &mut self.alloc)?;
+		self.set_ptr(ptr);
+		Ok(())
+	}
+
+	unsafe fn shrink(&mut self, amount: usize) -> Result<(), TryReserveError> {
+		match self.capacity() {
+			Some(capacity) => {
+				assert!(amount <= capacity, "Tried to shrink to a larger capacity");
+
+				let (ptr, layout) = if let Some(mem) = self.current_memory() {
+					mem
+				} else {
+					return Ok(())
+				};
+
+				let new_size = amount * mem::size_of::<T>();
+
+				let ptr = {
+					let new_layout = Layout::from_size_align_unchecked(new_size, layout.align());
+					self.alloc.shrink(ptr, layout, new_layout).map_err(|_| TryReserveError::AllocError {
+						layout: new_layout,
+						non_exhaustive: (),
+					})?
+				};
+
+				self.set_ptr(ptr);
+				Ok(())
+			},
+			None => {
+				panic!("Tried to shrink borrowed data")
+			}
+		}
+	}
+}
+
+// This function is outside `CalfVec` to minimize compile times. See the comment
+// above `RawVec::grow_amortized` for details. (The `A` parameter isn't
+// significant, because the number of different `A` types seen in practice is
+// much smaller than the number of `T` types.)
+#[inline(never)]
+fn finish_grow<A>(new_layout: Result<Layout, LayoutError>, current_memory: Option<(NonNull<u8>, Layout)>, alloc: &mut A) -> Result<NonNull<[u8]>, TryReserveError> where A: Allocator {
+	// Check for the error here to minimize the size of `CalfVec::grow_*`.
+	let new_layout = new_layout.map_err(|_| TryReserveError::CapacityOverflow)?;
+
+	alloc_guard(new_layout.size())?;
+
+	let memory = if let Some((ptr, old_layout)) = current_memory {
+		debug_assert_eq!(old_layout.align(), new_layout.align());
+		unsafe {
+			// The allocator checks for alignment equality
+			// intrinsics::assume(old_layout.align() == new_layout.align()); // TODO is thre a way to keep this optimisation outside of the compiler?
+			alloc.grow(ptr, old_layout, new_layout)
+		}
+	} else {
+		alloc.allocate(new_layout)
+	};
+
+	memory.map_err(|_| TryReserveError::AllocError { layout: new_layout, non_exhaustive: () })
+}
+
+impl<'a, M: Meta, T: Clone, A: Allocator + Clone, const N: usize> Clone for CalfVec<'a, M, T, A, N> {
 	fn clone(&self) -> CalfVec<'a, M, T, A, N> {
 		CalfVec::owned(self)
 	}
 }
 
-impl<'v, 'a, M: Meta, T: Clone, A: AllocRef + Clone, const N: usize> From<&'v CalfVec<'a, M, T, A, N>> for Vec<T, A> {
+impl<'v, 'a, M: Meta, T: Clone, A: Allocator + Clone, const N: usize> From<&'v CalfVec<'a, M, T, A, N>> for Vec<T, A> {
 	fn from(vec: &'v CalfVec<'a, M, T, A, N>) -> Vec<T, A> {
-		vec.to_vec_in(vec.alloc_ref().clone())
+		vec.to_vec_in(vec.allocator().clone())
 	}
 }
 
-impl<'a, M: Meta, T: Clone, A: AllocRef, const N: usize> From<CalfVec<'a, M, T, A, N>> for Vec<T, A> {
+impl<'a, M: Meta, T: Clone, A: Allocator, const N: usize> From<CalfVec<'a, M, T, A, N>> for Vec<T, A> {
 	fn from(vec: CalfVec<'a, M, T, A, N>) -> Vec<T, A> {
 		vec.into_vec()
 	}
 }
 
-unsafe impl<'a, M: Meta + Send, T: Sync, A: AllocRef + Send, const N: usize> Send for CalfVec<'a, M, T, A, N> {}
-unsafe impl<'a, M: Meta + Sync, T: Sync, A: AllocRef, const N: usize> Sync for CalfVec<'a, M, T, A, N> {}
+unsafe impl<'a, M: Meta + Send, T: Sync, A: Allocator + Send, const N: usize> Send for CalfVec<'a, M, T, A, N> {}
+unsafe impl<'a, M: Meta + Sync, T: Sync, A: Allocator, const N: usize> Sync for CalfVec<'a, M, T, A, N> {}
 
-impl<'a, M: Meta, T, A: AllocRef, const N: usize> Deref for CalfVec<'a, M, T, A, N> {
+impl<'a, M: Meta, T, A: Allocator, const N: usize> Deref for CalfVec<'a, M, T, A, N> {
 	type Target = [T];
 
 	#[inline]
@@ -833,14 +1270,14 @@ impl<'a, M: Meta, T, A: AllocRef, const N: usize> Deref for CalfVec<'a, M, T, A,
 	}
 }
 
-impl<'a, M: Meta, T, A: AllocRef, const N: usize> DerefMut for CalfVec<'a, M, T, A, N> where T: Clone {
+impl<'a, M: Meta, T, A: Allocator, const N: usize> DerefMut for CalfVec<'a, M, T, A, N> where T: Clone {
 	#[inline]
 	fn deref_mut(&mut self) -> &mut [T] {
 		self.as_mut_slice()
 	}
 }
 
-impl<'v, 'a, M: Meta, T, A: AllocRef, const N: usize> IntoIterator for &'v CalfVec<'a, M, T, A, N> {
+impl<'v, 'a, M: Meta, T, A: Allocator, const N: usize> IntoIterator for &'v CalfVec<'a, M, T, A, N> {
 	type Item = &'v T;
 	type IntoIter = std::slice::Iter<'v, T>;
 
@@ -849,7 +1286,7 @@ impl<'v, 'a, M: Meta, T, A: AllocRef, const N: usize> IntoIterator for &'v CalfV
 	}
 }
 
-impl<'v, 'a, M: Meta, T, A: AllocRef, const N: usize> IntoIterator for &'v mut CalfVec<'a, M, T, A, N> where T: Clone {
+impl<'v, 'a, M: Meta, T, A: Allocator, const N: usize> IntoIterator for &'v mut CalfVec<'a, M, T, A, N> where T: Clone {
 	type Item = &'v mut T;
 	type IntoIter = std::slice::IterMut<'v, T>;
 
@@ -858,18 +1295,18 @@ impl<'v, 'a, M: Meta, T, A: AllocRef, const N: usize> IntoIterator for &'v mut C
 	}
 }
 
-pub union IntoIterData<T, A: AllocRef, const N: usize> {
-	stack: ManuallyDrop<[T; N]>,
+pub union IntoIterData<T, A: Allocator, const N: usize> {
+	stack: ManuallyDrop<[MaybeUninit<T>; N]>,
 	vec: ManuallyDrop<std::vec::IntoIter<T, A>>
 }
 
-pub struct IntoIter<M: Meta, T, A: AllocRef, const N: usize> {
+pub struct IntoIter<M: Meta, T, A: Allocator, const N: usize> {
 	meta: M,
 	offset: usize,
 	data: IntoIterData<T, A, N>
 }
 
-impl<M: Meta, T, A: AllocRef, const N: usize> Iterator for IntoIter<M, T, A, N> {
+impl<M: Meta, T, A: Allocator, const N: usize> Iterator for IntoIter<M, T, A, N> {
 	type Item = T;
 
 	fn next(&mut self) -> Option<T> {
@@ -879,7 +1316,7 @@ impl<M: Meta, T, A: AllocRef, const N: usize> Iterator for IntoIter<M, T, A, N> 
 				let i = self.offset;
 				if i < self.meta.len() {
 					self.offset += 1;
-					Some(ptr::read(self.data.stack.as_ptr().add(i)))
+					Some(self.data.stack[i].assume_init_read())
 				} else {
 					None
 				}
@@ -892,7 +1329,7 @@ impl<M: Meta, T, A: AllocRef, const N: usize> Iterator for IntoIter<M, T, A, N> 
 	}
 }
 
-impl<M: Meta, T, A: AllocRef, const N: usize> Drop for IntoIter<M, T, A, N> {
+impl<M: Meta, T, A: Allocator, const N: usize> Drop for IntoIter<M, T, A, N> {
 	fn drop(&mut self) {
 		unsafe {
 			let capacity = self.meta.capacity().unwrap();
@@ -905,7 +1342,7 @@ impl<M: Meta, T, A: AllocRef, const N: usize> Drop for IntoIter<M, T, A, N> {
 	}
 }
 
-impl<'a, M: Meta, T, A: AllocRef, const N: usize> IntoIterator for CalfVec<'a, M, T, A, N> where T: Clone {
+impl<'a, M: Meta, T, A: Allocator, const N: usize> IntoIterator for CalfVec<'a, M, T, A, N> where T: Clone {
 	type Item = T;
 	type IntoIter = IntoIter<M, T, A, N>;
 
@@ -915,9 +1352,7 @@ impl<'a, M: Meta, T, A: AllocRef, const N: usize> IntoIterator for CalfVec<'a, M
 
 			let alloc = ptr::read(&self.alloc); // this is safe because `self.alloc` is not used ever after.
 			let meta = self.meta;
-			let mut data = Data {
-				ptr: ptr::null_mut()
-			};
+			let mut data = Data::dangling();
 			std::mem::swap(&mut data, &mut self.data);
 			std::mem::forget(self); // there is nothing left to drop in `self`, we can forget it.
 
@@ -926,7 +1361,7 @@ impl<'a, M: Meta, T, A: AllocRef, const N: usize> IntoIterator for CalfVec<'a, M
 					stack: data.stack
 				}
 			} else {
-				let vec = Vec::from_raw_parts_in(data.ptr, meta.len(), capacity, alloc);
+				let vec = Vec::from_raw_parts_in(data.ptr.as_ptr(), meta.len(), capacity, alloc);
 				IntoIterData {
 					vec: ManuallyDrop::new(vec.into_iter())
 				}
@@ -941,7 +1376,7 @@ impl<'a, M: Meta, T, A: AllocRef, const N: usize> IntoIterator for CalfVec<'a, M
 	}
 }
 
-impl<'a, M: Meta, T, A: AllocRef, const N: usize> Extend<T> for CalfVec<'a, M, T, A, N> where T: Clone {
+impl<'a, M: Meta, T, A: Allocator, const N: usize> Extend<T> for CalfVec<'a, M, T, A, N> where T: Clone {
 	#[inline]
 	fn extend<I: IntoIterator<Item = T>>(&mut self, iterator: I) {
 		let mut iterator = iterator.into_iter();
@@ -970,42 +1405,42 @@ impl<'a, M: Meta, T, A: AllocRef, const N: usize> Extend<T> for CalfVec<'a, M, T
 	// }
 }
 
-impl<'a, M: Meta, T: fmt::Debug, A: AllocRef, const N: usize> fmt::Debug for CalfVec<'a, M, T, A, N> {
+impl<'a, M: Meta, T: fmt::Debug, A: Allocator, const N: usize> fmt::Debug for CalfVec<'a, M, T, A, N> {
 	#[inline]
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		fmt::Debug::fmt(&**self, f)
 	}
 }
 
-impl<'a, M: Meta, T, A: AllocRef, const N: usize> AsRef<CalfVec<'a, M, T, A, N>> for CalfVec<'a, M, T, A, N> {
+impl<'a, M: Meta, T, A: Allocator, const N: usize> AsRef<CalfVec<'a, M, T, A, N>> for CalfVec<'a, M, T, A, N> {
 	#[inline]
 	fn as_ref(&self) -> &CalfVec<'a, M, T, A, N> {
 		self
 	}
 }
 
-impl<'a, M: Meta, T, A: AllocRef, const N: usize> AsMut<CalfVec<'a, M, T, A, N>> for CalfVec<'a, M, T, A, N> {
+impl<'a, M: Meta, T, A: Allocator, const N: usize> AsMut<CalfVec<'a, M, T, A, N>> for CalfVec<'a, M, T, A, N> {
 	#[inline]
 	fn as_mut(&mut self) -> &mut CalfVec<'a, M, T, A, N> {
 		self
 	}
 }
 
-impl<'a, M: Meta, T, A: AllocRef, const N: usize> AsRef<[T]> for CalfVec<'a, M, T, A, N> {
+impl<'a, M: Meta, T, A: Allocator, const N: usize> AsRef<[T]> for CalfVec<'a, M, T, A, N> {
 	#[inline]
 	fn as_ref(&self) -> &[T] {
 		self
 	}
 }
 
-impl<'a, M: Meta, T, A: AllocRef, const N: usize> AsMut<[T]> for CalfVec<'a, M, T, A, N> where T: Clone {
+impl<'a, M: Meta, T, A: Allocator, const N: usize> AsMut<[T]> for CalfVec<'a, M, T, A, N> where T: Clone {
 	#[inline]
 	fn as_mut(&mut self) -> &mut [T] {
 		self
 	}
 }
 
-impl<'a, M: Meta, T, A: AllocRef + Clone, const N: usize> From<Vec<T, A>> for CalfVec<'a, M, T, A, N> {
+impl<'a, M: Meta, T, A: Allocator + Clone, const N: usize> From<Vec<T, A>> for CalfVec<'a, M, T, A, N> {
 	#[inline]
 	fn from(v: Vec<T, A>) -> CalfVec<'a, M, T, A, N> {
 		CalfVec::owned(v)
@@ -1040,75 +1475,124 @@ macro_rules! impl_slice_eq1 {
 	}
 }
 
-impl_slice_eq1! { ['a, 'b, T, U, O: Meta, P: Meta, A: AllocRef, B: AllocRef, const N: usize, const M: usize] CalfVec<'a, O, T, A, N>, CalfVec<'b, P, U, B, M> }
-impl_slice_eq1! { ['a, T, U, M: Meta, A: AllocRef, B: AllocRef, const N: usize] CalfVec<'a, M, T, A, N>, Vec<U, B> }
-impl_slice_eq1! { ['b, T, U, M: Meta, A: AllocRef, B: AllocRef, const N: usize] Vec<T, A>, CalfVec<'b, M, U, B, N> }
-impl_slice_eq1! { ['a, T, U, M: Meta, A: AllocRef, const N: usize] CalfVec<'a, M, T, A, N>, &[U] }
-impl_slice_eq1! { ['a, T, U, M: Meta, A: AllocRef, const N: usize] CalfVec<'a, M, T, A, N>, &mut [U] }
-impl_slice_eq1! { ['b, T, U, M: Meta, A: AllocRef, const N: usize] &[T], CalfVec<'b, M, U, A, N> }
-impl_slice_eq1! { ['b, T, U, M: Meta, A: AllocRef, const N: usize] &mut [T], CalfVec<'b, M, U, A, N> }
-impl_slice_eq1! { ['a, T, U, M: Meta, A: AllocRef, const N: usize] CalfVec<'a, M, T, A, N>, Cow<'_, [U]> where U: Clone }
-impl_slice_eq1! { ['b, T, U, M: Meta, A: AllocRef, const N: usize] Cow<'_, [T]>, CalfVec<'b, M, U, A, N> where T: Clone }
-impl_slice_eq1! { ['a, T, U, M: Meta, A: AllocRef, const N: usize, const O: usize] CalfVec<'a, M, T, A, N>, [U; O] }
-impl_slice_eq1! { ['a, T, U, M: Meta, A: AllocRef, const N: usize, const O: usize] CalfVec<'a, M, T, A, N>, &[U; O] }
-impl_slice_eq1! { ['b, T, U, M: Meta, A: AllocRef, const N: usize, const O: usize] [T; O], CalfVec<'b, M, U, A, N> }
-impl_slice_eq1! { ['b, T, U, M: Meta, A: AllocRef, const N: usize, const O: usize] &[T; O], CalfVec<'b, M, U, A, N> }
+impl_slice_eq1! { ['a, 'b, T, U, O: Meta, P: Meta, A: Allocator, B: Allocator, const N: usize, const M: usize] CalfVec<'a, O, T, A, N>, CalfVec<'b, P, U, B, M> }
+impl_slice_eq1! { ['a, T, U, M: Meta, A: Allocator, B: Allocator, const N: usize] CalfVec<'a, M, T, A, N>, Vec<U, B> }
+impl_slice_eq1! { ['b, T, U, M: Meta, A: Allocator, B: Allocator, const N: usize] Vec<T, A>, CalfVec<'b, M, U, B, N> }
+impl_slice_eq1! { ['a, T, U, M: Meta, A: Allocator, const N: usize] CalfVec<'a, M, T, A, N>, &[U] }
+impl_slice_eq1! { ['a, T, U, M: Meta, A: Allocator, const N: usize] CalfVec<'a, M, T, A, N>, &mut [U] }
+impl_slice_eq1! { ['b, T, U, M: Meta, A: Allocator, const N: usize] &[T], CalfVec<'b, M, U, A, N> }
+impl_slice_eq1! { ['b, T, U, M: Meta, A: Allocator, const N: usize] &mut [T], CalfVec<'b, M, U, A, N> }
+impl_slice_eq1! { ['a, T, U, M: Meta, A: Allocator, const N: usize] CalfVec<'a, M, T, A, N>, Cow<'_, [U]> where U: Clone }
+impl_slice_eq1! { ['b, T, U, M: Meta, A: Allocator, const N: usize] Cow<'_, [T]>, CalfVec<'b, M, U, A, N> where T: Clone }
+impl_slice_eq1! { ['a, T, U, M: Meta, A: Allocator, const N: usize, const O: usize] CalfVec<'a, M, T, A, N>, [U; O] }
+impl_slice_eq1! { ['a, T, U, M: Meta, A: Allocator, const N: usize, const O: usize] CalfVec<'a, M, T, A, N>, &[U; O] }
+impl_slice_eq1! { ['b, T, U, M: Meta, A: Allocator, const N: usize, const O: usize] [T; O], CalfVec<'b, M, U, A, N> }
+impl_slice_eq1! { ['b, T, U, M: Meta, A: Allocator, const N: usize, const O: usize] &[T; O], CalfVec<'b, M, U, A, N> }
 
-impl<'a, M: Meta, T: Eq, A: AllocRef, const N: usize> Eq for CalfVec<'a, M, T, A, N> {}
+impl<'a, M: Meta, T: Eq, A: Allocator, const N: usize> Eq for CalfVec<'a, M, T, A, N> {}
+
+// Central function for reserve error handling.
+#[inline]
+fn handle_reserve(result: Result<(), TryReserveError>) {
+	match result {
+		Err(TryReserveError::CapacityOverflow) => capacity_overflow(),
+		Err(TryReserveError::AllocError { layout, .. }) => handle_alloc_error(layout),
+		Ok(()) => { /* yay */ }
+	}
+}
+
+// We need to guarantee the following:
+// * We don't ever allocate `> isize::MAX` byte-size objects.
+// * We don't overflow `usize::MAX` and actually allocate too little.
+//
+// On 64-bit we just need to check for overflow since trying to allocate
+// `> isize::MAX` bytes will surely fail. On 32-bit and 16-bit we need to add
+// an extra guard for this in case we're running on a platform which can use
+// all 4GB in user-space, e.g., PAE or x32.
+#[inline]
+fn alloc_guard(alloc_size: usize) -> Result<(), TryReserveError> {
+	if usize::BITS < 64 && alloc_size > isize::MAX as usize {
+		Err(TryReserveError::CapacityOverflow)
+	} else {
+		Ok(())
+	}
+}
+
+// One central function responsible for reporting capacity overflows. This'll
+// ensure that the code generation related to these panics is minimal as there's
+// only one location which panics rather than a bunch throughout the module.
+fn capacity_overflow() -> ! {
+	panic!("capacity overflow");
+}
 
 pub trait ToCalfVec {
-	fn to_calf_vec<M: Meta, A: AllocRef, const N: usize>(s: &[Self], alloc: A) -> CalfVec<M, Self, A, N> where Self: Sized;
+	/// Convert the input slice into a `CalfVec` with at least the given capacity.
+	fn to_calf_vec_with_capacity<'t, M: Meta, A: Allocator, const N: usize>(s: &[Self], capacity: usize, alloc: A) -> CalfVec<'t, M, Self, A, N> where Self: Sized;
+
+	#[inline]
+	fn to_calf_vec<'t, M: Meta, A: Allocator, const N: usize>(s: &[Self], alloc: A) -> CalfVec<'t, M, Self, A, N> where Self: Sized {
+		Self::to_calf_vec_with_capacity(s, s.len(), alloc)
+	}
 }
 
 impl<T: Clone> ToCalfVec for T {
 	#[inline]
-	default fn to_calf_vec<M: Meta, A: AllocRef, const N: usize>(s: &[Self], alloc: A) -> CalfVec<M, Self, A, N> {
-		// struct DropGuard<'a, T, A: AllocRef> {
-		// 	vec: &'a mut Vec<T, A>,
-		// 	num_init: usize,
-		// }
-		// impl<'a, T, A: AllocRef> Drop for DropGuard<'a, T, A> {
-		// 	#[inline]
-		// 	fn drop(&mut self) {
-		// 		// SAFETY:
-		// 		// items were marked initialized in the loop below
-		// 		unsafe {
-		// 			self.vec.set_len(self.num_init);
-		// 		}
-		// 	}
-		// }
-		// let mut vec = Vec::with_capacity_in(s.len(), alloc);
-		// let mut guard = DropGuard { vec: &mut vec, num_init: 0 };
-		// let slots = guard.vec.spare_capacity_mut();
-		// // .take(slots.len()) is necessary for LLVM to remove bounds checks
-		// // and has better codegen than zip.
-		// for (i, b) in s.iter().enumerate().take(slots.len()) {
-		// 	guard.num_init = i;
-		// 	slots[i].write(b.clone());
-		// }
-		// core::mem::forget(guard);
-		// // SAFETY:
-		// // the vec was allocated and initialized above to at least this length.
-		// unsafe {
-		// 	vec.set_len(s.len());
-		// }
-		// vec
-		panic!("TODO")
+	default fn to_calf_vec_with_capacity<'t, M: Meta, A: Allocator, const N: usize>(s: &[Self], capacity: usize, alloc: A) -> CalfVec<'t, M, Self, A, N> {
+		struct DropGuard<'a, 'b, M: Meta, T, A: Allocator, const N: usize> {
+			vec: &'a mut CalfVec<'b, M, T, A, N>,
+			num_init: usize,
+		}
+
+		impl<'a, 'b, M: Meta, T, A: Allocator, const N: usize> Drop for DropGuard<'a, 'b, M, T, A, N> {
+			#[inline]
+			fn drop(&mut self) {
+				// SAFETY:
+				// items were marked initialized in the loop below
+				unsafe {
+					self.vec.set_len(self.num_init);
+				}
+			}
+		}
+
+		let capacity = cmp::max(capacity, s.len());
+		let mut vec = CalfVec::with_capacity_in(capacity, alloc);
+		let mut guard = DropGuard { vec: &mut vec, num_init: 0 };
+
+		let slots = guard.vec.spare_capacity_mut();
+
+		// .take(slots.len()) is necessary for LLVM to remove bounds checks
+		// and has better codegen than zip.
+		for (i, b) in s.iter().enumerate().take(slots.len()) {
+			guard.num_init = i;
+			slots[i].write(b.clone());
+		}
+
+		core::mem::forget(guard);
+
+		// SAFETY:
+		// the vec was allocated and initialized above to at least this length.
+		unsafe {
+			vec.set_len(s.len());
+		}
+
+		vec
 	}
 }
 
 impl<T: Copy> ToCalfVec for T {
 	#[inline]
-	fn to_calf_vec<M: Meta, A: AllocRef, const N: usize>(s: &[Self], alloc: A) -> CalfVec<M, Self, A, N> {
-		// let mut v = Vec::with_capacity_in(s.len(), alloc);
-		// // SAFETY:
-		// // allocated above with the capacity of `s`, and initialize to `s.len()` in
-		// // ptr::copy_to_non_overlapping below.
-		// unsafe {
-		// 	s.as_ptr().copy_to_nonoverlapping(v.as_mut_ptr(), s.len());
-		// 	v.set_len(s.len());
-		// }
-		// v
-		panic!("TODO")
+	fn to_calf_vec_with_capacity<'t, M: Meta, A: Allocator, const N: usize>(s: &[Self], capacity: usize, alloc: A) -> CalfVec<'t, M, Self, A, N> {
+		let capacity = cmp::max(capacity, s.len());
+		let mut v = CalfVec::with_capacity_in(capacity, alloc);
+
+		// SAFETY:
+		// allocated above with the capacity of `s`, and initialize to `s.len()` in
+		// ptr::copy_to_non_overlapping below.
+		unsafe {
+			s.as_ptr().copy_to_nonoverlapping(v.as_mut_ptr(), s.len());
+			v.set_len(s.len());
+		}
+
+		v
 	}
 }

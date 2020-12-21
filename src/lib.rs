@@ -52,6 +52,10 @@
 #![feature(shrink_to)]
 #![feature(allocator_api)]
 #![feature(specialization)]
+#![feature(int_bits_const)]
+#![feature(try_reserve)]
+#![feature(maybe_uninit_extra)]
+#![feature(slice_ptr_len)]
 
 pub mod generic;
 pub mod string;

@@ -1,15 +1,15 @@
-use std::{
-	alloc::{
-		AllocRef,
-		Global
-	},
+use core::{
+	alloc::Allocator,
 	str,
 	ptr,
 	fmt,
 	ops::{
 		Deref,
 		DerefMut
-	},
+	}
+};
+use std::{
+	alloc::Global,
 	borrow::Cow
 };
 use crate::generic::{
@@ -36,13 +36,19 @@ use crate::generic::{
 /// [`std::str`]: core::str
 /// [`&str`]: prim@str
 /// [`utf8_error`]: Self::utf8_error
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FromUtf8Error<'a, M: Meta, A: AllocRef, const N: usize> {
+#[derive(Debug, Clone)]
+pub struct FromUtf8Error<'a, M: Meta, A: Allocator, const N: usize> {
 	bytes: CalfVec<'a, M, u8, A, N>,
 	error: str::Utf8Error
 }
 
-impl<'a, M: Meta, A: AllocRef, const N: usize> FromUtf8Error<'a, M, A, N> {
+impl<'a, 'b, O: Meta, P: Meta, A: Allocator, B: Allocator, const M: usize, const N: usize> PartialEq<FromUtf8Error<'b, P, B, N>> for FromUtf8Error<'a, O, A, M> {
+	fn eq(&self, other: &FromUtf8Error<'b, P, B, N>) -> bool {
+		self.error == other.error && self.bytes == other.bytes
+	}
+}
+
+impl<'a, M: Meta, A: Allocator, const N: usize> FromUtf8Error<'a, M, A, N> {
 	/// Returns a slice of [`u8`]s bytes that were attempted to convert to a `CalfString`.
 	pub fn as_bytes(&self) -> &[u8] {
 		&self.bytes
@@ -74,7 +80,7 @@ impl<'a, M: Meta, A: AllocRef, const N: usize> FromUtf8Error<'a, M, A, N> {
 
 type FromUtf16Error = std::string::FromUtf16Error;
 
-pub struct CalfString<'a, M: Meta, A: AllocRef, const N: usize> {
+pub struct CalfString<'a, M: Meta, A: Allocator, const N: usize> {
 	/// Internal bytes buffer.
 	vec: CalfVec<'a, M, u8, A, N>
 }
@@ -186,7 +192,7 @@ impl<'a, M: Meta, const N: usize> CalfString<'a, M, Global, N> {
 	}
 }
 
-impl<'a, M: Meta, A: AllocRef, const N: usize> CalfString<'a, M, A, N> {
+impl<'a, M: Meta, A: Allocator, const N: usize> CalfString<'a, M, A, N> {
 	/// Returns this `String`'s size, in bytes.
 	#[inline]
 	pub fn len(&self) -> usize {
@@ -494,7 +500,7 @@ impl<'a, M: Meta, A: AllocRef, const N: usize> CalfString<'a, M, A, N> {
 	}
 }
 
-impl<'a, M: Meta, A: AllocRef, const N: usize> Deref for CalfString<'a, M, A, N> {
+impl<'a, M: Meta, A: Allocator, const N: usize> Deref for CalfString<'a, M, A, N> {
 	type Target = str;
 
 	#[inline]
@@ -505,11 +511,11 @@ impl<'a, M: Meta, A: AllocRef, const N: usize> Deref for CalfString<'a, M, A, N>
 	}
 }
 
-impl<'a, M: Meta, A: AllocRef, const N: usize> DerefMut for CalfString<'a, M, A, N> {
+impl<'a, M: Meta, A: Allocator, const N: usize> DerefMut for CalfString<'a, M, A, N> {
 	#[inline]
 	fn deref_mut(&mut self) -> &mut str {
 		unsafe {
-			std::str::from_utf8_unchecked_mut(&mut self.vec)
+			std::str::from_utf8_unchecked_mut(self.vec.as_mut_slice())
 		}
 	}
 }
@@ -550,35 +556,42 @@ impl<'a, M: Meta, const N: usize> std::str::FromStr for CalfString<'a, M, Global
 	}
 }
 
-impl<'a, M: Meta, A: AllocRef, const N: usize> PartialEq<str> for CalfString<'a, M, A, N> {
+impl<'a, M: Meta, A: Allocator, const N: usize> PartialEq<str> for CalfString<'a, M, A, N> {
 	#[inline]
 	fn eq(&self, other: &str) -> bool {
 		self.as_str() == other
 	}
 }
 
-impl<'a, 'b, M: Meta, A: AllocRef, const N: usize> PartialEq<&'b str> for CalfString<'a, M, A, N> {
+impl<'a, 'b, M: Meta, A: Allocator, const N: usize> PartialEq<&'b str> for CalfString<'a, M, A, N> {
 	#[inline]
 	fn eq(&self, other: &&'b str) -> bool {
 		self.as_str() == *other
 	}
 }
 
-impl<'a, M: Meta, A: AllocRef, const N: usize> PartialEq<String> for CalfString<'a, M, A, N> {
+impl<'a, M: Meta, A: Allocator, const N: usize> PartialEq<String> for CalfString<'a, M, A, N> {
 	#[inline]
 	fn eq(&self, other: &String) -> bool {
 		self.as_str() == other
 	}
 }
 
-impl<'a, M: Meta, A: AllocRef, const N: usize> fmt::Display for CalfString<'a, M, A, N> {
+impl<'a, 'b, O: Meta, P: Meta, A: Allocator, B: Allocator, const M: usize, const N: usize> PartialEq<CalfString<'b, P, B, N>> for CalfString<'a, O, A, M> {
+	#[inline]
+	fn eq(&self, other: &CalfString<'b, P, B, N>) -> bool {
+		self.as_str() == other.as_str()
+	}
+}
+
+impl<'a, M: Meta, A: Allocator, const N: usize> fmt::Display for CalfString<'a, M, A, N> {
 	#[inline]
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		fmt::Display::fmt(&**self, f)
 	}
 }
 
-impl<'a, M: Meta, A: AllocRef, const N: usize> fmt::Debug for CalfString<'a, M, A, N> {
+impl<'a, M: Meta, A: Allocator, const N: usize> fmt::Debug for CalfString<'a, M, A, N> {
 	#[inline]
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		fmt::Debug::fmt(&**self, f)
