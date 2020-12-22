@@ -1,12 +1,10 @@
 use core::{
 	alloc::{
 		Allocator,
-		Layout,
-		LayoutError
+		Layout
 	},
 	marker::PhantomData,
 	mem::{
-		self,
 		ManuallyDrop,
 		MaybeUninit
 	},
@@ -18,8 +16,7 @@ use core::{
 		Deref,
 		DerefMut
 	},
-	fmt,
-	cmp
+	fmt
 };
 use std::{
 	alloc::{
@@ -418,10 +415,12 @@ impl<'a, M: Meta, T, A: Allocator, const N: usize> CalfVec<'a, M, T, A, N> where
 				let len = self.len();
 				let slice = std::slice::from_raw_parts(self.raw.as_ptr(), len);
 
-				let alloc = ptr::read(self.allocator()); // this is safe because `self.alloc` is never used ever after.
-				let mut vec = T::to_calf_vec(slice, alloc);
-				std::mem::swap(&mut vec, self);
-				std::mem::forget(vec);
+				match self.raw.prepare_exact(len, 0) {
+					Ok(dst) => {
+						T::import(slice, dst);
+					},
+					Err(_) => panic!("Allocation failed")
+				}
 
 				self.capacity().unwrap()
 			}
@@ -479,8 +478,13 @@ impl<'a, M: Meta, T, A: Allocator, const N: usize> CalfVec<'a, M, T, A, N> where
 
 	/// The same as `reserve`, but returns on errors instead of panicking or aborting.
 	pub fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError> {
-		if let Some(dst) = self.raw.try_reserve(self.len(), additional)? {
-			panic!("TODO") // copy to buffer.
+		let ptr = self.as_ptr();
+		let len = self.len();
+		if let Some(dst) = self.raw.try_reserve(len, additional)? {
+			unsafe {
+				let src = std::slice::from_raw_parts(ptr, len);
+				T::import(src, dst)
+			}
 		}
 
 		Ok(())
@@ -517,8 +521,13 @@ impl<'a, M: Meta, T, A: Allocator, const N: usize> CalfVec<'a, M, T, A, N> where
 
 	/// The same as `reserve`, but returns on errors instead of panicking or aborting.
 	pub fn try_reserve_exact(&mut self, additional: usize) -> Result<(), TryReserveError> {
-		if let Some(dst) = self.raw.try_reserve_exact(self.len(), additional)? {
-			panic!("TODO") // copy to buffer.
+		let ptr = self.as_ptr();
+		let len = self.len();
+		if let Some(dst) = self.raw.try_reserve_exact(len, additional)? {
+			unsafe {
+				let src = std::slice::from_raw_parts(ptr, len);
+				T::import(src, dst)
+			}
 		}
 
 		Ok(())
@@ -1119,74 +1128,40 @@ fn capacity_overflow() -> ! {
 	panic!("capacity overflow");
 }
 
-pub trait ToCalfVec {
-	/// Convert the input slice into a `CalfVec` with at least the given capacity.
-	fn to_calf_vec_with_capacity<'t, M: Meta, A: Allocator, const N: usize>(s: &[Self], capacity: usize, alloc: A) -> CalfVec<'t, M, Self, A, N> where Self: Sized;
+pub trait Import {
+	unsafe fn import(s: &[Self], dest: *mut Self) where Self: Sized;
+}
 
+impl<T: Clone> Import for T {
 	#[inline]
-	fn to_calf_vec<'t, M: Meta, A: Allocator, const N: usize>(s: &[Self], alloc: A) -> CalfVec<'t, M, Self, A, N> where Self: Sized {
-		Self::to_calf_vec_with_capacity(s, s.len(), alloc)
+	default unsafe fn import(s: &[Self], dst: *mut Self) where Self: Sized {
+		// .take(s.len()) is necessary for LLVM to remove bounds checks.
+		for (i, b) in s.iter().enumerate().take(s.len()) {
+			ptr::write(dst.add(i), b.clone());
+		}
 	}
 }
 
-impl<T: Clone> ToCalfVec for T {
+impl<T: Copy> Import for T {
 	#[inline]
-	default fn to_calf_vec_with_capacity<'t, M: Meta, A: Allocator, const N: usize>(s: &[Self], capacity: usize, alloc: A) -> CalfVec<'t, M, Self, A, N> {
-		struct DropGuard<'a, 'b, M: Meta, T, A: Allocator, const N: usize> {
-			vec: &'a mut CalfVec<'b, M, T, A, N>,
-			num_init: usize,
-		}
+	unsafe fn import(s: &[Self], dst: *mut Self) where Self: Sized {
+		s.as_ptr().copy_to_nonoverlapping(dst, s.len());
+	}
+}
 
-		impl<'a, 'b, M: Meta, T, A: Allocator, const N: usize> Drop for DropGuard<'a, 'b, M, T, A, N> {
-			#[inline]
-			fn drop(&mut self) {
-				// SAFETY:
-				// items were marked initialized in the loop below
-				unsafe {
-					self.vec.set_len(self.num_init);
-				}
-			}
-		}
+pub trait ToCalfVec {
+	fn to_calf_vec<'t, M: Meta, A: Allocator, const N: usize>(s: &[Self], alloc: A) -> CalfVec<'t, M, Self, A, N> where Self: Sized;
+}
 
-		let capacity = cmp::max(capacity, s.len());
+impl<T: Import> ToCalfVec for T {
+	fn to_calf_vec<'t, M: Meta, A: Allocator, const N: usize>(s: &[Self], alloc: A) -> CalfVec<'t, M, Self, A, N> where Self: Sized {
+		let capacity = s.len();
 		let mut vec = CalfVec::with_capacity_in(capacity, alloc);
-		let mut guard = DropGuard { vec: &mut vec, num_init: 0 };
 
-		let slots = guard.vec.spare_capacity_mut();
-
-		// .take(slots.len()) is necessary for LLVM to remove bounds checks
-		// and has better codegen than zip.
-		for (i, b) in s.iter().enumerate().take(slots.len()) {
-			guard.num_init = i;
-			slots[i].write(b.clone());
-		}
-
-		core::mem::forget(guard);
-
-		// SAFETY:
-		// the vec was allocated and initialized above to at least this length.
 		unsafe {
-			vec.set_len(s.len());
+			T::import(s, vec.owned_as_mut_ptr());
 		}
 
 		vec
-	}
-}
-
-impl<T: Copy> ToCalfVec for T {
-	#[inline]
-	fn to_calf_vec_with_capacity<'t, M: Meta, A: Allocator, const N: usize>(s: &[Self], capacity: usize, alloc: A) -> CalfVec<'t, M, Self, A, N> {
-		let capacity = cmp::max(capacity, s.len());
-		let mut v = CalfVec::with_capacity_in(capacity, alloc);
-
-		// SAFETY:
-		// allocated above with the capacity of `s`, and initialize to `s.len()` in
-		// ptr::copy_to_non_overlapping below.
-		unsafe {
-			s.as_ptr().copy_to_nonoverlapping(v.as_mut_ptr(), s.len());
-			v.set_len(s.len());
-		}
-
-		v
 	}
 }

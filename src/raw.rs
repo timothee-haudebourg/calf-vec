@@ -62,13 +62,6 @@ pub union Data<T, const N: usize> {
 
 impl<T, const N: usize> Data<T, N> {
 	#[inline]
-	const fn dangling() -> Data<T, N> {
-		Data {
-			ptr: NonNull::dangling()
-		}
-	}
-
-	#[inline]
 	fn new(init: AllocInit) -> Data<T, N> {
 		match init {
 			AllocInit::Uninitialized => {
@@ -421,8 +414,7 @@ impl<M: Meta, T, A: Allocator, const N: usize> RawCalfVec<M, T, A, N> where T: C
 						Ok(None)
 					},
 					None => { // borrowed
-						self.prepare_amortized(len, additional)?;
-						Ok(Some(self.data.ptr.as_ptr()))
+						Ok(Some(self.prepare_amortized(len, additional)?))
 					}
 				}
 			} else {
@@ -568,42 +560,46 @@ impl<M: Meta, T, A: Allocator, const N: usize> RawCalfVec<M, T, A, N> where T: C
 	}
 
 	/// Prepare enough memory to store `len + additional` elements either on the stack or on the heap.
-	unsafe fn prepare_amortized(&mut self, len: usize, additional: usize) -> Result<(), TryReserveError> {
+	pub unsafe fn prepare_amortized(&mut self, len: usize, additional: usize) -> Result<*mut T, TryReserveError> {
 		debug_assert!(self.is_borrowed());
 
 		let required_capacity = len.checked_add(additional).ok_or(TryReserveError::CapacityOverflow)?;
 		let capacity = cmp::max(len * 2, required_capacity);
 
-		if capacity <= N {
-			self.meta.set_capacity(Some(N))
+		let ptr = if capacity <= N {
+			self.meta.set_capacity(Some(N));
+			(&mut self.data.stack).as_mut_ptr() as *mut T
 		} else {
 			let new_layout = Layout::array::<T>(capacity);
 
 			// `finish_grow` is non-generic over `T`.
 			let ptr = finish_grow(new_layout, self.current_memory(), &mut self.alloc)?;
 			self.set_ptr(ptr);
-		}
+			self.data.ptr.as_ptr()
+		};
 
-		Ok(())
+		Ok(ptr)
 	}
 
 	/// Prepare enough memory to store `len + additional` elements either on the stack or on the heap.
-	unsafe fn prepare_exact(&mut self, len: usize, additional: usize) -> Result<(), TryReserveError> {
+	pub unsafe fn prepare_exact(&mut self, len: usize, additional: usize) -> Result<*mut T, TryReserveError> {
 		debug_assert!(self.is_borrowed());
 
 		let capacity = len.checked_add(additional).ok_or(TryReserveError::CapacityOverflow)?;
 
-		if capacity <= N {
-			self.meta.set_capacity(Some(N))
+		let ptr = if capacity <= N {
+			self.meta.set_capacity(Some(N));
+			(&mut self.data.stack).as_mut_ptr() as *mut T
 		} else {
 			let new_layout = Layout::array::<T>(capacity);
 
 			// `finish_grow` is non-generic over `T`.
 			let ptr = finish_grow(new_layout, self.current_memory(), &mut self.alloc)?;
 			self.set_ptr(ptr);
-		}
+			self.data.ptr.as_ptr()
+		};
 
-		Ok(())
+		Ok(ptr)
 	}
 
 	/// Spill the data stored on the stack into the heap with some additional capacity.
