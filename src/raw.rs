@@ -627,7 +627,7 @@ impl<M: Meta, T, A: Allocator, const N: usize> RawCalfVec<M, T, A, N> where T: C
 			Err(_) => handle_alloc_error(layout),
 		};
 
-		self.data.ptr.as_ptr().copy_to_nonoverlapping(dst.as_ptr().cast(), N);
+		self.data.stack.as_ptr().copy_to_nonoverlapping(dst.as_ptr().cast(), N);
 
 		self.set_ptr(dst);
 
@@ -653,7 +653,7 @@ impl<M: Meta, T, A: Allocator, const N: usize> RawCalfVec<M, T, A, N> where T: C
 			Err(_) => handle_alloc_error(layout),
 		};
 
-		self.data.ptr.as_ptr().copy_to_nonoverlapping(dst.as_ptr().cast(), N);
+		self.data.stack.as_ptr().copy_to_nonoverlapping(dst.as_ptr().cast(), N);
 
 		self.set_ptr(dst);
 

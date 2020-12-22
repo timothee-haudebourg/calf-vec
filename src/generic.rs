@@ -175,9 +175,11 @@ impl<'a, M: Meta, T, A: Allocator, const N: usize> CalfVec<'a, M, T, A, N> {
 	#[inline]
 	pub fn borrowed_in<B: AsRef<[T]> + ?Sized>(borrowed: &'a B, alloc: A) -> Self {
 		let slice = borrowed.as_ref();
+		let mut raw: RawCalfVec<M, _, _, N> = RawCalfVec::borrowed_in(unsafe { NonNull::new_unchecked(slice.as_ptr() as *mut T) }, alloc);
+		raw.meta_mut().set_len(slice.len());
 
 		CalfVec {
-			raw: RawCalfVec::borrowed_in(unsafe { NonNull::new_unchecked(slice.as_ptr() as *mut T) }, alloc),
+			raw,
 			lifetime: PhantomData
 		}
 	}
@@ -191,7 +193,7 @@ impl<'a, M: Meta, T, A: Allocator, const N: usize> CalfVec<'a, M, T, A, N> {
 		let vec = owned.into();
 		let (ptr, len, capacity, alloc) = vec.into_raw_parts_with_alloc();
 
-		let raw = unsafe {
+		let mut raw: RawCalfVec<M, _, _, N> = unsafe {
 			if capacity <= N {
 				// put on stack.
 				let mut raw = RawCalfVec::with_capacity_in(N, alloc);
@@ -207,6 +209,8 @@ impl<'a, M: Meta, T, A: Allocator, const N: usize> CalfVec<'a, M, T, A, N> {
 				RawCalfVec::spilled_in(NonNull::new_unchecked(ptr), capacity, alloc)
 			}
 		};
+		
+		raw.meta_mut().set_len(len);
 
 		CalfVec {
 			raw,
@@ -1155,11 +1159,13 @@ pub trait ToCalfVec {
 
 impl<T: Import> ToCalfVec for T {
 	fn to_calf_vec<'t, M: Meta, A: Allocator, const N: usize>(s: &[Self], alloc: A) -> CalfVec<'t, M, Self, A, N> where Self: Sized {
-		let capacity = s.len();
+		let len = s.len();
+		let capacity = len;
 		let mut vec = CalfVec::with_capacity_in(capacity, alloc);
 
 		unsafe {
 			T::import(s, vec.owned_as_mut_ptr());
+			vec.set_len(len);
 		}
 
 		vec

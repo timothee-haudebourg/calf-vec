@@ -1,0 +1,65 @@
+{
+	// Use IntelliSense to learn about possible attributes.
+	// Hover to view descriptions of existing attributes.
+	// For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+	"version": "0.2.0",
+	"configurations": [
+		{
+			"type": "lldb",
+			"request": "launch",
+			"name": "Debug unit tests in library 'calf-vec'",
+			"cargo": {
+				"args": [
+					"test",
+					"--no-run",
+					"--lib",
+					"--package=calf-vec"
+				],
+				"filter": {
+					"name": "calf-vec",
+					"kind": "lib"
+				}
+			},
+			"args": [],
+			"cwd": "${workspaceFolder}"
+		},
+		{
+			"type": "lldb",
+			"request": "launch",
+			"name": "Debug integration test 'string'",
+			"cargo": {
+				"args": [
+					"test",
+					"--no-run",
+					"--test=string",
+					"--package=calf-vec"
+				],
+				"filter": {
+					"name": "string",
+					"kind": "test"
+				}
+			},
+			"args": [],
+			"cwd": "${workspaceFolder}"
+		},
+		{
+			"type": "lldb",
+			"request": "launch",
+			"name": "Debug integration test 'vec'",
+			"cargo": {
+				"args": [
+					"test",
+					"--no-run",
+					"--test=vec",
+					"--package=calf-vec"
+				],
+				"filter": {
+					"name": "vec",
+					"kind": "test"
+				}
+			},
+			"args": [],
+			"cwd": "${workspaceFolder}"
+		}
+	]
+}
